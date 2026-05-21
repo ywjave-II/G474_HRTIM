@@ -23,8 +23,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-#include "test.h"
-#include "driver.h"
+
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -98,7 +97,7 @@ int main(void)
     HRTIM_TIMERID_MASTER |
     HRTIM_TIMERID_TIMER_A |
     HRTIM_TIMERID_TIMER_C);
-    DRIVER_Run(0, 0);
+    
   /* USER CODE END 2 */
 
   /* Infinite loop */
