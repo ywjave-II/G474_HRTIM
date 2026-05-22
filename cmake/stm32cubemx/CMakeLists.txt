@@ -15,6 +15,7 @@ set(MX_Include_Dirs
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Inc/Legacy
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/CMSIS/Device/ST/STM32G4xx/Include
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/CMSIS/Include
+    C:/Users/ywjAv/STM32Cube/Repository//Packs/STMicroelectronics/X-CUBE-ALGOBUILD/1.4.0/Middlewares/Third_Party/ARM/DSP/Inc
 )
 
 # STM32CubeMX generated application sources
@@ -22,6 +23,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/gpio.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/hrtim.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/usart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/stm32g4xx_hal_msp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/sysmem.c
@@ -46,6 +48,8 @@ set(STM32_Drivers_Src
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr_ex.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cortex.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c
 )
 
 # Drivers Midllewares
