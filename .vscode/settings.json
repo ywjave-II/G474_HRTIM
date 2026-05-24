@@ -1,4 +1,5 @@
 {
+    "cortex-debug.armToolchainPath": "C:/Users/ywjAv/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin",
     "cmake.cmakePath": "cube-cmake",
     "cmake.configureArgs": [
         "-DCMAKE_COMMAND=cube-cmake"

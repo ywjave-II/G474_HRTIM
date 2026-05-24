@@ -26,6 +26,7 @@
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
 #include "io_retarget.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -92,15 +93,32 @@ int main(void)
   MX_HRTIM1_Init();
   MX_USART1_UART_Init();
   /* USER CODE BEGIN 2 */
-  HAL_HRTIM_WaveformOutputStart(&hhrtim1,
+  // 禁用Fault，清除上电误触发
+  HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_DISABLED);
+//HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_6, HRTIM_FAULTMODECTL_DISABLED);
+//HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT6C;
+HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C;
+
+// 启动PWM输出
+HAL_HRTIM_WaveformOutputStart(&hhrtim1,
     HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
     HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
 
-  HAL_HRTIM_WaveformCountStart(&hhrtim1,
+HAL_HRTIM_WaveformCountStart(&hhrtim1,
     HRTIM_TIMERID_MASTER |
     HRTIM_TIMERID_TIMER_A |
     HRTIM_TIMERID_TIMER_C);
-    
+
+// 等待PC10上拉稳定
+HAL_Delay(1);
+
+// 清除延迟期间可能产生的误触发
+// HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT6C;
+HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C;
+// 重新使能Fault 6
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_ENABLED);
+//HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_6, HRTIM_FAULTMODECTL_ENABLED);
+char buf[64];
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -110,6 +128,13 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    sprintf(buf, "ISR=0x%08lX PA12=%d PC10=%d\r\n",
+    HRTIM1->sCommonRegs.ISR,
+    (GPIOA->IDR >> 12) & 1,
+    (GPIOC->IDR >> 10) & 1);
+    HAL_UART_Transmit(&huart1,buf, sizeof(buf), 100);
+    HAL_Delay(200);
+    
   }
   /* USER CODE END 3 */
 }
@@ -134,7 +159,7 @@ void SystemClock_Config(void)
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV2;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV3;
   RCC_OscInitStruct.PLL.PLLN = 85;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;
