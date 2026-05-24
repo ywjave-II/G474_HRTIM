@@ -2,4 +2,4 @@ build
 mx.scratch
 .settings/
 .claude/
-.vscode/tasks.json
+.vscode/
