@@ -1,5 +1,9 @@
 # G474_HRTIM 工程实现总结
 
+> 本文档于 2026-06-02 依据实际源码全面校订。工程已从"固定 200kHz 互补 PWM"
+> 演进为 **LLC 变频软启动（PFM 扫频）+ 三路比较器硬件保护**。历史 200kHz / test.c(PID)
+> 等内容已被取代，保留于"踩坑记录"与"历史沿革"中。
+
 ## 目标硬件
 
 | 项目 | 参数 |
@@ -10,7 +14,36 @@
 | Flash | 512 KB |
 | RAM | 128 KB（Heap 512 B，Stack 1024 B） |
 
-应用场景：**半桥 LLC 谐振变换器**驱动固件，硬件 bring-up 已完成。
+应用场景：**半桥 LLC 谐振变换器**驱动固件，采用 **PFM 变频控制**。当前为**开环变频软启动**，闭环未实现。
+
+---
+
+## 系统架构总览
+
+```
+main()
+ ├─ SystemClock_Config()                 170 MHz
+ ├─ MX_GPIO_Init()                        LED1/2/3 = PC1/PC2/PC3（开漏，低电平点亮）
+ ├─ MX_HRTIM1_Init()                      PWM + 死区 + 3 路 Fault
+ ├─ MX_DAC1/2/4_Init()                    比较器阈值源
+ ├─ MX_ADC1/2_Init()                      VOUT/IOU/I_CYCLE 等（配置但从未启动采样）
+ ├─ MX_COMP2/4/6_Init()                   保护检测
+ ├─ MX_USART3_UART_Init()                 调试串口
+ ├─ [安全启动序列] 屏蔽 Fault → 启 COMP/DAC → 延时 → 清标志 → 使能 Fault
+ ├─ HAL_HRTIM_WaveformOutputStart/CountStart()
+ ├─ LLC_SoftStart_Init()  ──┐
+ └─ Fault_IRQ_Enable()      │            使能 FLT 中断(IER)；NVIC 由 CubeMX MspInit 开
+                            ↓
+HRTIM1_Master_IRQHandler ─→ LLC_SoftStart_Step()   // 每次 MREP 中断扫频
+   (stm32g4xx_it.c)            (App/freq_skip.c)    ← 唯一活跃的运行时控制逻辑
+
+COMP2/4/6 ──(内部 Fault 线)──→ HRTIM Fault1/2/3 ──→ 硬件强制 PWM 输出 INACTIVE
+                                      └─→ HRTIM1_FLT_IRQHandler → Fault_OnIRQ()  // 软件记录+点灯
+                                            (App/fault_log.c)
+```
+
+> **核心控制循环是中断驱动的**：`while(1)` 主循环为空（main.c）。
+> 真正反复执行的逻辑是 `LLC_SoftStart_Step()`。
 
 ---
 
@@ -18,77 +51,117 @@
 
 ### 1. 时钟系统配置
 
-- 使用外部高速晶振（HSE **12 MHz**）作为 PLL 输入
-- PLL 配置：PLLM=3，PLLN=85，PLLR=2，SYSCLK = 170 MHz
-- 电压调节器工作在 `SCALE1_BOOST` 模式（支持 170 MHz 满速运行）
-- Flash 延迟配置为 4 个等待周期（FLASH_LATENCY_4）
+- HSE **12 MHz** → PLLM=3，PLLN=85，PLLR=2，SYSCLK = 170 MHz
+- 电压调节器 `SCALE1_BOOST`，Flash 延迟 `FLASH_LATENCY_4`
 
-### 2. HRTIM 高分辨率 PWM 输出（核心功能）
+### 2. HRTIM 高分辨率 PWM（功率级硬件层，`Src/hrtim.c`）
 
 **时基配置：**
 
 | 参数 | 值 | 说明 |
 |---|---|---|
 | 预分频 | MUL32 | 等效时钟 5440 MHz，分辨率 ≈ 184 ps |
-| 周期寄存器 | **27200** | PWM 频率 200 kHz（5440 MHz / 200 kHz） |
-| 重复计数器 | 0 | 每周期更新 |
-| 工作模式 | CONTINUOUS | Master + Timer A/C 均连续运行 |
+| 周期寄存器（初值）| **27200** | 200 kHz（上电瞬时值，随即被软启动覆盖为 300kHz）|
+| 重复计数器 | **3** | 每 **4** 个 PWM 周期触发一次更新/MREP 中断 |
+| Master 模式 | CONTINUOUS | 主时基连续运行 |
+| Timer A/C 模式 | SINGLESHOT_RETRIGGERABLE | 由 `ResetTrigger=MASTER_PER` 周期重触发 |
+
+> ⚠️ Timer A 配置了 `InterleavedMode = DUAL`（Timer C 为 DISABLED）。
 
 **Timer A — 原边半桥驱动（PA8 / PA9）：**
-
-- TA1（PA8）：`TIMPER` 置位（计数器复位后拉高），`CMP1=13600` 复位，占空比 50%
-- TA2（PA9）：由死区模块硬件自动生成互补信号，**不配置 Set/Reset 源**
-- Timer A 由 `MASTER_PER` 事件复位同步（`ResetTrigger = MASTER_PER`）
+- TA1（PA8）：`SetSource = MASTERPER` 置位，`ResetSource = TIMCMP1` 复位
+- TA2（PA9）：由死区硬件自动生成互补信号，**不配置 Set/Reset 源**
 
 **Timer C — 副边同步整流驱动（PB12 / PB13）：**
+- TC1（PB12）：`SetSource = TIMCMP1`（CMP1=13600）置位，`ResetSource = TIMCMP4`（CMP4=26858）复位，与原边 180° 移相
+- TC2（PB13）：由死区硬件自动生成互补信号
 
-- TC1（PB12）：`CMP1=13600` 置位，`CMP2=27199` 复位，与 TA1 形成 180° 移相
-- TC2（PB13）：由死区模块硬件自动生成互补信号，**不配置 Set/Reset 源**
-- 移相量通过调整 TC1 的 CMP1/CMP2 值控制
-
-**死区配置（实测验证 250 ns）：**
+**死区（实测验证 250 ns）：**
 
 | 参数 | 值 | 说明 |
 |---|---|---|
 | 预分频宏 | `HRTIM_TIMDEADTIME_PRESCALERRATIO_MUL8` | 死区时钟 = f_HRTIM × 8 = **1360 MHz** |
-| 死区 tick | **0.735 ns**（= 1/1360 MHz） | 注意：基准是 f_HRTIM=170 MHz，非等效时钟 |
-| RisingValue / FallingValue | **340** | 340 × 0.735 ns ≈ 250 ns |
+| 死区 tick | **0.735 ns** | 基准是 f_HRTIM=170 MHz，**非**等效时钟 5440 MHz |
+| Rising/FallingValue | **340** | 340 × 0.735 ns ≈ 250 ns |
 
-> ⚠️ **关键陷阱**：死区模块时钟基准是 `f_HRTIM`（170 MHz），不是高分辨率等效时钟（5440 MHz）。
-> `MUL8` 宏含义：死区时钟 = 170 MHz × 8 = 1360 MHz，tick ≈ 0.735 ns。
+**死区插入规则：** 启用 `DeadTimeInsertion` 后，互补通道（TA2/TC2）完全由死区硬件接管，只需配置主通道（TA1/TC1）的 Set/Reset 源；TA2/TC2 的 `WaveformOutputConfig` 设为 `SetSource=NONE/ResetSource=NONE`。
 
-**死区插入规则：**
-- 启用 `DeadTimeInsertion` 后，**互补通道（TA2/TC2）完全由死区硬件接管**
-- 只需配置主通道（TA1/TC1）的 Set/Reset 源
-- **不能**再对 TA2/TC2 调用 `HAL_HRTIM_WaveformOutputConfig`，否则会覆盖死区控制
+**DLL 校准：** 启动时执行（`CALIBRATIONRATE_3`，超时 10 ms）。
 
-**DLL 校准：** 启动时执行（`CALIBRATIONRATE_3`，超时 100 ms），保证高分辨率精度。
+### 3. LLC 变频软启动（核心控制，`App/freq_skip.c` / `freq_skip.h`）
 
-**输出启动顺序（main.c）：**
-```c
-HAL_HRTIM_WaveformOutputStart(&hhrtim1,
-    HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
-    HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+通过周期性增大 HRTIM 周期寄存器，把开关频率从 **300 kHz 缓降到 130 kHz**（LLC 谐振点），实现软启动。
 
-HAL_HRTIM_WaveformCountStart(&hhrtim1,
-    HRTIM_TIMERID_MASTER |
-    HRTIM_TIMERID_TIMER_A |
-    HRTIM_TIMERID_TIMER_C);
-```
+| 宏 | 值 | 物理含义 |
+|---|---|---|
+| `LLC_FREQ_START_PER` | 18133 | 起始周期 = **300 kHz**（高频 → 低增益）|
+| `LLC_FREQ_TARGET_PER` | 41846 | 目标周期 = **130 kHz**（谐振频率）|
+| `LLC_SOFTSTART_STEP` | 10 | 每次扫频的周期增量（越大降频越快）|
+| `LLC_SKIP_COUNT` | 10 | 每 10 次 MREP 中断扫频一次 |
 
-### 3. UART 调试串口（USART1）
+> 频率换算：5440 MHz ÷ 18133 = 300 kHz；5440 MHz ÷ 41846 = 130 kHz。
 
-- 引脚：PC4（TX）/ PC5（RX），波特率 115200-8N1
-- 通过 `App/io_retarget.c` 将 `printf` / `scanf` 重定向到 USART1
-- 支持浮点数打印：链接器选项 `-Wl,-u,_printf_float`
+**状态机（隐式，单向不可逆）：**
 
-### 4. ARM CMSIS-DSP 数学库
+| 状态 | `softstart_done` | 转换条件 | 动作 |
+|---|---|---|---|
+| RAMPING（扫频中）| 0 | 上电 `LLC_SoftStart_Init()` | 每 10 次中断 `llc_period += 10`，更新 MPER / TimerA PER / TimerC PER / CMP1(=period/2，180°移相) / CMP4(=period-342，关断点) |
+| DONE（到位）| 1 | `llc_period >= 41846` | 钳位到目标周期，停止扫频 |
 
-- 库版本：X-CUBE-ALGOBUILD 1.4.0
-- 预编译库：`libarm_cortexM4lf_math.a`（硬浮点 Cortex-M4F 专用）
+软启动直接写寄存器（`HRTIM1->sMasterRegs.MPER` 等），不走 HAL。
+
+### 4. 硬件保护（三路比较器 → HRTIM Fault，`comp.c` + `dac.c`）
+
+| 通道 | 检测引脚 | 阈值源 | 触发 | 动作 |
+|---|---|---|---|---|
+| COMP2 → Fault1 | PA3 | DAC1_CH2 = 2048 (≈1.65V)，迟滞 10mV | INP > 阈值（高电平）| HRTIM 硬件封锁全部 PWM 输出 → `FAULTLEVEL_INACTIVE` |
+| COMP4 → Fault2 | PB0 | DAC1_CH1 = 2048，无迟滞 | 同上 | 同上 |
+| COMP6 → Fault3 | PB11 | DAC4_CH2 = 2048，无迟滞 | 同上 | 同上 |
+
+- 推测对应 LLC 的**过流/过压硬件快速保护（OCP/OVP）**。
+- 硬件封锁是**纳秒级、不依赖软件**的；软件记录由 `fault_log` 模块在中断里补做（见下）。
+- **无消抖**：`FAULTFILTER_NONE` + 计数阈值 0，对噪声敏感（风险点）。
+
+**上电防误触发序列（main.c）：**
+1. `FaultModeCtl(DISABLED)` 屏蔽 Fault1/2/3
+2. 清 `ICR` 故障标志
+3. `HAL_COMP_Start` + `HAL_DAC_SetValue(2048)` 建立阈值
+4. `HAL_Delay(1)` 等 DAC 上拉稳定
+5. 再清一次 `ICR`
+6. `FaultModeCtl(ENABLED)` 正式使能保护
+7. （软启动后）`Fault_IRQ_Enable()` 使能 FLT 中断 + NVIC
+
+### 4b. 故障软件记录（`App/fault_log.c` / `fault_log.h`）
+
+把"纯硬件锁死、软件无感知"升级为"硬件锁死 + 软件可记录可恢复"。
+
+- **中断**：`HRTIM1_FLT_IRQHandler`（中断号 `HRTIM1_FLT_IRQn`，**独立于 Master**）→ `Fault_OnIRQ()`。
+- **判别哪一路**：必须用 `__HAL_HRTIM_GET_FLAG`（读 ISR）。⚠️ 本 HAL 版本 `__HAL_HRTIM_GET_ITSTATUS` 只查 IER（是否使能），不查 ISR，不能用来判触发。
+- **记录**：全局 `volatile fault_record_t g_fault` —— 各路次数 `flt1/2/3_cnt`、`total_cnt`、`last_fault`（哪一路）、`last_tick`（HAL_GetTick 时刻）、`tripped`（锁死标志）。
+- **指示灯**：FLT1/2/3 → **LED1/LED2/LED3 = PC1/PC2/PC3**（开漏，低电平点亮）。`Fault_IRQ_Enable()` 先熄灭三灯做基线（gpio.c 上电默认拉低=点亮）。
+- **防中断风暴**：FAULT 无滤波，比较器电平保持高时清标志会立刻重置 → 记录一次后**关闭本路 FLT 中断**（`__HAL_HRTIM_DISABLE_IT`），恢复时再开。
+- **锁死不自动恢复**：ISR 只记录+点灯，PWM 保持硬件封锁。恢复必须显式调 `Fault_Rearm()`（清 ICR → `WaveformOutputStart` 重启输出 → 重新武装中断 + 熄灯）。对 LLC 过流/过压这是安全做法，**不要自动恢复**。
+
+**接线方式（已采用 regen-safe 方案）：**
+- CubeMX System Core → NVIC **已勾选** "HRTIM1 fault global interrupt"，故：
+  - NVIC（`HRTIM1_FLT_IRQn`）由 CubeMX 在 `HAL_HRTIM_MspInit` 自动开启；
+  - CubeMX 在 `stm32g4xx_it.c` 标准区生成 `HRTIM1_FLT_IRQHandler`，`Fault_OnIRQ()` 写在它的 `USER CODE BEGIN HRTIM1_FLT_IRQn 0` 块内（在 `HAL_HRTIM_IRQHandler(...COMMON)` 之前）。
+  - `Fault_OnIRQ()` 已读/清 ISR 并关本路 IT，故其后的 `HAL_HRTIM_IRQHandler` 对故障部分为空操作，不重复处理。
+- **以后重新生成代码不再冲突**（USER CODE 块内容被保留，且不再有手写的同名 handler）。
+- ⚠️ 仍必须保留 `Fault_IRQ_Enable()` 里的 `__HAL_HRTIM_ENABLE_IT(...FLT...)`：工程用 `WaveformCountStart`（非 `_IT`），`Init.HRTIMInterruptResquests` 不会被 HAL 写入 IER；CubeMX 只开了 NVIC，没开 HRTIM 级别的中断使能。
+
+### 5. UART 调试串口（USART3）
+
+- 引脚：**PB9（TX）/ PB8（RX）**，波特率 115200-8N1，时钟源 PCLK1
+- `App/io_retarget.c` 将 `printf` / `scanf` 重定向到 USART3
+- 浮点打印：链接器选项 `-Wl,-u,_printf_float`
+
+### 6. ARM CMSIS-DSP 数学库
+
+- X-CUBE-ALGOBUILD 1.4.0，预编译 `libarm_cortexM4lf_math.a`（硬浮点 Cortex-M4F）
 - 编译宏：`ARM_MATH_CM4` + `ARM_MATH_LOOPUNROLL`
 
-### 5. 开发环境
+### 7. 开发环境
 
 | 项目 | 说明 |
 |---|---|
@@ -101,39 +174,77 @@ HAL_HRTIM_WaveformCountStart(&hhrtim1,
 
 ---
 
-## 踩坑记录
+## 中断服务函数（ISR）
 
-### HRTIM Period 计算
-- **错误**：Period = 850（对应频率 ~6.4 MHz，不是 200 kHz）
-- **正确**：Period = f_HRTIM_等效 / f_PWM = 5440 MHz / 200 kHz = **27200**
-
-### 死区时间计算
-- **错误**：以为死区基准时钟是等效时钟（5440 MHz），算出 170 ticks
-- **正确**：死区基准是 f_HRTIM = 170 MHz，MUL8 → 1360 MHz，需要 **340 ticks**
-
-### 死区互补通道配置
-- **错误**：启用死区后仍对 TA2/TC2 调用 `WaveformOutputConfig`（SetSource=NONE）
-- **正确**：启用死区后 TA2/TC2 由硬件接管，**跳过** TA2/TC2 的输出配置
-
-### Timer A/C 模式
-- **错误**：Timer A/C 设为 `SINGLESHOT_RETRIGGERABLE`
-- **正确**：应为 `CONTINUOUS`，靠 `ResetTrigger=MASTER_PER` 做周期同步
-
-### TA1 置位源
-- **错误**：`SetSource = MASTERPER`，与 `ResetTrigger=MASTER_PER` 同时触发冲突
-- **正确**：`SetSource = TIMPER`（Timer A 自身周期事件，即复位后置位）
+| ISR | 触发条件 | 作用 |
+|---|---|---|
+| `HRTIM1_Master_IRQHandler` | HRTIM Master 重复事件 MREP（每 4 个 PWM 周期）| 清 MREP 标志 → `LLC_SoftStart_Step()` 扫频 |
+| `HRTIM1_FLT_IRQHandler` | HRTIM Fault1/2/3（COMP2/4/6 越限）| `Fault_OnIRQ()`：记录通道/次数/时刻、点亮对应 LED、关本路中断防风暴 |
+| `SysTick_Handler` | 1 ms 节拍 | `HAL_IncTick()`（供 `HAL_Delay`）|
+| `NMI / HardFault / MemManage / BusFault / UsageFault` | CPU 异常 | 死循环挂起 |
 
 ---
 
-## 尚未实现的功能（占位桩）
+## 关键参数汇总表
 
-| 模块 | 文件 | 当前状态 |
+| 参数 | 值 | 单位 | 位置 | 含义 |
+|---|---|---|---|---|
+| PLLN | 85 | — | main.c:221 | SYSCLK 170 MHz |
+| LLC_FREQ_START_PER | 18133 | tick | freq_skip.h:10 | 软启动起始 300 kHz |
+| LLC_FREQ_TARGET_PER | 41846 | tick | freq_skip.h:11 | 软启动目标 130 kHz |
+| LLC_SOFTSTART_STEP | 10 | tick | freq_skip.h:12 | 扫频步进 |
+| LLC_SKIP_COUNT | 10 | 次 | freq_skip.h:14 | 中断分频 |
+| Period（初值）| 27200 | tick | hrtim.c:81 | 200 kHz 上电瞬时值 |
+| RepetitionCounter | 3 | — | hrtim.c:82 | 4 周期更新 |
+| 死区 Rising/Falling | 340 | tick | hrtim.c:158/162 | 250 ns |
+| TC1 CMP1 | 13600 | tick | hrtim.c:211 | 180° 移相置位点 |
+| TC1 CMP4 | 26858 | tick | hrtim.c:151 | 关断点 |
+| 软启动 CMP1 | period/2 | tick | freq_skip.c:50 | 移相跟随 |
+| 软启动 CMP4 | period-342 | tick | freq_skip.c:51 | 关断点跟随 |
+| DAC 阈值 | 2048 | LSB | main.c:140/143/146 | 比较器阈值 ≈1.65 V |
+| COMP2 迟滞 | 10 | mV | comp.c:46 | 抗抖动 |
+
+---
+
+## 踩坑记录
+
+### HRTIM Period 计算
+- Period = f_HRTIM_等效 / f_PWM = 5440 MHz / f。例：200 kHz→27200，300 kHz→18133，130 kHz→41846。
+
+### 死区时间计算
+- **错误**：以为死区基准是等效时钟（5440 MHz）→ 算出 170 ticks。
+- **正确**：死区基准是 f_HRTIM = 170 MHz，MUL8 → 1360 MHz，需要 **340 ticks**。
+
+### 死区互补通道配置
+- 启用死区后 TA2/TC2 由硬件接管，主通道之外不要再赋有效 Set/Reset 源（设为 NONE）。
+
+### 软启动直接写寄存器
+- `LLC_SoftStart_Step()` 绕过 HAL 直接写 `MPER/PERxR/CMPxR`，并通过预装载（`PreloadEnable`）在 MREP 时刻安全生效。修改频率参数时务必同步更新 CMP1（移相）与 CMP4（关断点），否则波形错乱。
+
+### 故障防误触发
+- DAC 阈值建立需要时间，**必须**先屏蔽 Fault、`HAL_Delay(1)` 后再清标志使能，否则上电瞬间会误锁死。
+
+### FLT 中断判别 / 防风暴
+- 判"哪一路触发"用 `__HAL_HRTIM_GET_FLAG`（读 ISR）；`__HAL_HRTIM_GET_ITSTATUS` 只查 IER（是否使能），不可用于判触发。
+- FAULT 无滤波，比较器电平保持高时清标志会立刻重置 → ISR 记录后须 `__HAL_HRTIM_DISABLE_IT` 关本路中断防风暴。
+- 工程用 `WaveformCountStart`（非 `_IT`），故 FLT 中断须在 `Fault_IRQ_Enable()` 里手动 `__HAL_HRTIM_ENABLE_IT`；`Init.HRTIMInterruptResquests` 字段不会被消费。
+
+### CubeMX 重新生成 FLT handler 冲突（已解决）
+- 教训：把中断处理写成独立的 `HRTIM1_FLT_IRQHandler`（USER CODE 1）后，一旦在 CubeMX 勾选该 NVIC，会另生成同名 handler → 链接重定义报错。
+- 现行做法：handler 调用统一放进生成 handler 的 `USER CODE BEGIN HRTIM1_FLT_IRQn 0` 块（见 §4b），不再手写同名函数 → regen-safe。
+
+---
+
+## 尚未实现 / 风险点
+
+| 项 | 文件 | 状态 |
 |---|---|---|
-| 闭环控制驱动 | `App/driver.c` | `DRIVER_Run(ref, fb)` 仅返回 `ref - fb` |
-| PID 控制器 | `App/test.c` | `PID_Run(ref, fb)` 仅返回 `ref - fb` |
-| ADC 采样 | — | 未配置 |
-| 保护逻辑 | — | HRTIM 故障输入未使用 |
-| 闭环调节 | — | 主循环为空，无控制代码 |
+| 闭环控制 | `App/driver.c` | `DRIVER_Run(ref,fb)` 仅返回 `ref-fb`，**从未被调用**（孤立桩）|
+| ADC 反馈采样 | `Src/adc.c` | ADC1/2 已配置（VOUT/IOU/I_CYCLE 等），但**从未 `HAL_ADC_Start`**，无反馈 → 当前纯开环 |
+| 故障恢复 | `App/fault_log.c` | 已有 `Fault_Rearm()` 可手动恢复；**无自动恢复**（对 OCP/OVP 是有意为之）|
+| 故障上报 | — | `g_fault` 已记录，但 `while(1)` 空，尚未串口打印 |
+| Fault 消抖 | `hrtim.c` | `FAULTFILTER_NONE`，对噪声敏感 |
+| 主循环 | `main.c` | `while(1)` 为空 |
 
 ---
 
@@ -141,30 +252,41 @@ HAL_HRTIM_WaveformCountStart(&hhrtim1,
 
 ```
 G474_HRTIM/
-├── Src/            CubeMX 生成（main.c, hrtim.c, gpio.c, syscalls.c, ...）
+├── Src/            CubeMX 生成（main.c, hrtim.c, comp.c, dac.c, adc.c, usart.c, gpio.c, ...）
 ├── Inc/            CubeMX 头文件
-├── App/            用户代码（自动 GLOB 编译）
-│   ├── io_retarget.c/h    printf → USART1 重定向
-│   ├── driver.c/h         控制驱动桩
-│   └── test.c/h           PID 控制桩
-├── .vscode/
-│   ├── launch.json        Cortex-Debug 调试配置
-│   ├── tasks.json         编译 + 烧录任务
-│   └── settings.json      GDB 路径、CMake 配置
+├── App/            用户代码（自动 GLOB 编译，App/*.c）
+│   ├── io_retarget.c/h    printf → USART3 重定向
+│   ├── freq_skip.c/h      LLC 变频软启动（核心控制）
+│   ├── fault_log.c/h      HRTIM 故障中断记录 + 恢复（g_fault / Fault_Rearm）
+│   └── driver.c/h         控制驱动桩（未使用）
 ├── cmake/
 │   ├── gcc-arm-none-eabi.cmake   工具链 + 链接器标志
 │   └── stm32cubemx/CMakeLists.txt
 ├── CMakeLists.txt
-└── CMakePresets.json
+├── CMakePresets.json
+└── HRTIM.ioc       CubeMX 工程配置
 ```
+
+> 注：`.vscode/` 与旧 `App/test.c·test.h`（PID 桩）已移除。
 
 ---
 
-## 当前状态
+## 历史沿革
 
-> **硬件驱动层已完成并实测验证**：
-> - PA8/PA9：200 kHz 互补 PWM，50% 占空比，死区 250 ns ✓
-> - PB12/PB13：200 kHz 互补 PWM，与原边 180° 移相，死区 250 ns ✓
-> - UART 调试接口可用，DSP 库已集成
+- **v1（已被取代）**：固定 200 kHz 互补 PWM，50% 占空比，副边 180° 移相，死区 250 ns，UART 走 USART1(PC4/PC5)，用 `App/test.c` 做 PID 桩。CLAUDE.md 早期版本描述此状态。
+- **v2**：变频软启动（300→130 kHz PFM），新增 COMP2/4/6 + DAC1/2/4 硬件保护，UART 改为 USART3(PB9/PB8)，删除 test.c，新增 freq_skip.c。
+- **v3（当前）**：新增 `fault_log` 故障中断记录（`HRTIM1_FLT_IRQHandler` → `Fault_OnIRQ`，三路 LED 指示 + `Fault_Rearm` 恢复）；引脚重排（LED1/2/3=PC1/2/3，ADC 增配 VOUT/IOU/I_CYCLE + ADC2）。
+
+---
+
+## 当前状态与下一步
+
+> **已完成**：
+> - PA8/PA9、PB12/PB13 互补 PWM，180° 移相，死区 250 ns ✓（实测）
+> - 300→130 kHz 变频软启动（中断驱动）✓
+> - 三路比较器硬件 OCP/OVP 保护（锁死型）✓
+> - 故障软件记录：FLT 中断 → `g_fault` 记录 + LED 指示 + `Fault_Rearm` 手动恢复 ✓（已编译链接，FLASH 9%/RAM 2.4%）
+> - UART(USART3) 调试 + DSP 库集成 ✓
 >
-> **下一步**：实现 ADC 采样 → PID 控制算法 → 将控制输出写入 HRTIM 比较寄存器实现闭环调节。
+> **下一步**：把 `g_fault` 经串口打印上报；启动 ADC 采样（Vout/Iout 反馈）→ 在主循环或定时中断中跑 PID/`DRIVER_Run` →
+> 用控制输出动态调节 HRTIM 周期（PFM 调压）实现闭环；可选给 Fault 加滤波消抖。

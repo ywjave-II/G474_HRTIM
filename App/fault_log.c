@@ -1,0 +1,178 @@
+#include "fault_log.h"
+#include "freq_skip.h"     /* llc_period / softstart_done，用于打印实际开关频率 */
+#include "vout_adc.h"      /* g_vout_raw / g_vout_mv，用于打印 VOUT 采样 */
+#include <stdio.h>         /* printf -> USART3（io_retarget.c 重定向）*/
+
+/* 等效计数时钟：HRTIM MUL32，5440 MHz。fsw = 5440e6 / period */
+#define HRTIM_EQUIV_CLK_HZ   5440000000ULL
+
+/* 故障记录全局实例（只在此定义一次）*/
+volatile fault_record_t g_fault = {0};
+
+#define FLT_IT_ALL    (HRTIM_IT_FLT1   | HRTIM_IT_FLT2   | HRTIM_IT_FLT3)
+#define FLT_FLAG_ALL  (HRTIM_FLAG_FLT1 | HRTIM_FLAG_FLT2 | HRTIM_FLAG_FLT3)
+
+/* 故障指示灯：LED1/2/3 = PC1/PC2/PC3，开漏，低电平(RESET)点亮 */
+#define FAULT_LED_ON(port, pin)   HAL_GPIO_WritePin((port), (pin), GPIO_PIN_RESET)
+#define FAULT_LED_OFF(port, pin)  HAL_GPIO_WritePin((port), (pin), GPIO_PIN_SET)
+
+void Fault_IRQ_Enable(void)
+{
+    /* 基线：熄灭三路故障灯（gpio.c 上电默认把 LED 拉低=点亮，需在此复位），
+     * 之后 "某灯点亮" 即代表对应通道故障已触发 */
+    FAULT_LED_OFF(LED1_GPIO_Port, LED1_Pin);
+    FAULT_LED_OFF(LED2_GPIO_Port, LED2_Pin);
+    FAULT_LED_OFF(LED3_GPIO_Port, LED3_Pin);
+
+    /* 先清 ISR 标志，避免上电/启动期间的历史误触发一开中断就立刻进 ISR */
+    __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, FLT_FLAG_ALL);
+
+    /* 工程使用 HAL_HRTIM_WaveformCountStart（非 _IT 版），IER 不会被自动写入，
+     * 故此处显式使能 FLT1/2/3 中断（与 freq_skip 里手动开 MREP 中断同样的做法）。
+     * NVIC（HRTIM1_FLT_IRQn）已由 CubeMX 在 HAL_HRTIM_MspInit 中开启，此处无需重复。*/
+    __HAL_HRTIM_ENABLE_IT(&hhrtim1, FLT_IT_ALL);
+}
+
+void Fault_OnIRQ(void)
+{
+    /* 注意：__HAL_HRTIM_GET_ITSTATUS 在本 HAL 版本只查 IER（是否使能），
+     * 不查 ISR。要判断"哪一路真的触发"必须用 __HAL_HRTIM_GET_FLAG 读 ISR。*/
+
+    if (__HAL_HRTIM_GET_FLAG(&hhrtim1, HRTIM_FLAG_FLT1))
+    {
+        __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, HRTIM_FLAG_FLT1);
+        __HAL_HRTIM_DISABLE_IT(&hhrtim1, HRTIM_IT_FLT1);   /* 防中断风暴 */
+        g_fault.flt1_cnt++;
+        g_fault.last_fault = FAULT_FLT1;
+        FAULT_LED_ON(LED1_GPIO_Port, LED1_Pin);            /* COMP2/PA3 */
+    }
+    if (__HAL_HRTIM_GET_FLAG(&hhrtim1, HRTIM_FLAG_FLT2))
+    {
+        __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, HRTIM_FLAG_FLT2);
+        __HAL_HRTIM_DISABLE_IT(&hhrtim1, HRTIM_IT_FLT2);
+        g_fault.flt2_cnt++;
+        g_fault.last_fault = FAULT_FLT2;
+        FAULT_LED_ON(LED2_GPIO_Port, LED2_Pin);            /* COMP4/PB0 */
+    }
+    if (__HAL_HRTIM_GET_FLAG(&hhrtim1, HRTIM_FLAG_FLT3))
+    {
+        __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, HRTIM_FLAG_FLT3);
+        __HAL_HRTIM_DISABLE_IT(&hhrtim1, HRTIM_IT_FLT3);
+        g_fault.flt3_cnt++;
+        g_fault.last_fault = FAULT_FLT3;
+        FAULT_LED_ON(LED3_GPIO_Port, LED3_Pin);            /* COMP6/PB11 */
+    }
+
+    g_fault.total_cnt++;
+    g_fault.last_tick = HAL_GetTick();
+    g_fault.tripped   = 1;
+}
+
+void Fault_Report_Poll(void)
+{
+    /* ---- 1) 故障边沿打印：仅在 total_cnt 变化（有新故障进入 ISR）时打印一次 ---- */
+    static uint32_t last_total = 0;
+    uint32_t total = g_fault.total_cnt;     /* volatile 快照 */
+    if (total != last_total)
+    {
+        last_total = total;
+
+        const char *src;
+        switch (g_fault.last_fault)
+        {
+            case FAULT_FLT1: src = "FLT1  COMP2/PA3  (DAC1_CH2 阈值)"; break;
+            case FAULT_FLT2: src = "FLT2  COMP4/PB0  (DAC1_CH1 阈值)"; break;
+            case FAULT_FLT3: src = "FLT3  COMP6/PB11 (DAC4_CH2 阈值)"; break;
+            default:         src = "NONE";                             break;
+        }
+
+        printf("\r\n==== HRTIM FAULT TRIGGER! (OCP/OVP, PWM LOCK) ====\r\n");
+        printf("  最近触发 : %s\r\n", src);
+        printf("  触发时刻 : %lu ms\r\n", (unsigned long)g_fault.last_tick);
+        printf("  各路次数 : FLT1=%lu  FLT2=%lu  FLT3=%lu  总计=%lu\r\n",
+               (unsigned long)g_fault.flt1_cnt,
+               (unsigned long)g_fault.flt2_cnt,
+               (unsigned long)g_fault.flt3_cnt,
+               (unsigned long)g_fault.total_cnt);
+        printf("  锁死标志 : tripped=%u （需排除故障源后调用 Fault_Rearm() 恢复）\r\n",
+               g_fault.tripped);
+
+        uint32_t per = llc_period;
+        if (per)
+        {
+            printf("  故障瞬时 : period=%lu, fsw=%lu Hz\r\n",
+                   (unsigned long)per,
+                   (unsigned long)(HRTIM_EQUIV_CLK_HZ / per));
+        }
+        printf("====================================================\r\n");
+    }
+
+    /* ---- 2) 每秒状态心跳：核对实测开关频率 / 软启动是否到位 ---- */
+    static uint32_t last_hb = 0;
+    uint32_t now = HAL_GetTick();
+    if ((now - last_hb) >= 1000U)
+    {
+        last_hb = now;
+        uint32_t per = llc_period;
+        printf("[STAT] period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu | VOUT raw=%u (%u mV)\r\n",
+               (unsigned long)per,
+               (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
+               softstart_done,
+               g_fault.tripped,
+               (unsigned long)g_fault.total_cnt,
+               g_vout_raw,
+               g_vout_mv);
+    }
+
+    /* ---- 3) 软启动完成后打印一次 Timer A / Timer C 关键寄存器，定位 260k 问题 ----
+     * 关注：两路 PER 是否一致、CMP1/CMP4 是否合理、TIMxCR 的 HALF 位、SET1/RST1
+     * 输出源、RSTR 计数器复位源。A 正常(130k)、C 翻倍(260k)，对比即可看出差异。*/
+    static uint8_t reg_dumped = 0;
+    if (softstart_done && !reg_dumped)
+    {
+        reg_dumped = 1;
+        printf("[REGS] MASTER MCR=%08lX  MPER=%lu\r\n",
+               (unsigned long)HRTIM1->sMasterRegs.MCR,
+               (unsigned long)HRTIM1->sMasterRegs.MPER);
+        printf("[REGS] TIMA CR=%08lX PER=%lu CMP1=%lu CMP4=%lu SET1=%08lX RST1=%08lX RSTR=%08lX\r\n",
+               (unsigned long)HRTIM1->sTimerxRegs[0].TIMxCR,
+               (unsigned long)HRTIM1->sTimerxRegs[0].PERxR,
+               (unsigned long)HRTIM1->sTimerxRegs[0].CMP1xR,
+               (unsigned long)HRTIM1->sTimerxRegs[0].CMP4xR,
+               (unsigned long)HRTIM1->sTimerxRegs[0].SETx1R,
+               (unsigned long)HRTIM1->sTimerxRegs[0].RSTx1R,
+               (unsigned long)HRTIM1->sTimerxRegs[0].RSTxR);
+        printf("[REGS] TIMC CR=%08lX PER=%lu CMP1=%lu CMP4=%lu SET1=%08lX RST1=%08lX RSTR=%08lX\r\n",
+               (unsigned long)HRTIM1->sTimerxRegs[2].TIMxCR,
+               (unsigned long)HRTIM1->sTimerxRegs[2].PERxR,
+               (unsigned long)HRTIM1->sTimerxRegs[2].CMP1xR,
+               (unsigned long)HRTIM1->sTimerxRegs[2].CMP4xR,
+               (unsigned long)HRTIM1->sTimerxRegs[2].SETx1R,
+               (unsigned long)HRTIM1->sTimerxRegs[2].RSTx1R,
+               (unsigned long)HRTIM1->sTimerxRegs[2].RSTxR);
+    }
+}
+
+void Fault_Rearm(void)
+{
+    /* 仅在确认故障源（过流/过压）已排除后调用！*/
+
+    /* 1. 清 HRTIM 故障标志 */
+    HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT2C | HRTIM_ICR_FLT3C;
+
+    /* 2. 重新使能 PWM 输出（fault 触发后输出被强制到 inactive，必须重启输出）*/
+    HAL_HRTIM_WaveformOutputStart(&hhrtim1,
+        HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
+        HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+
+    /* 3. 清记录、重新武装中断 */
+    g_fault.tripped    = 0;
+    g_fault.last_fault = FAULT_NONE;
+    __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, FLT_FLAG_ALL);
+    __HAL_HRTIM_ENABLE_IT(&hhrtim1, FLT_IT_ALL);
+
+    /* 熄灭三路故障灯 */
+    FAULT_LED_OFF(LED1_GPIO_Port, LED1_Pin);
+    FAULT_LED_OFF(LED2_GPIO_Port, LED2_Pin);
+    FAULT_LED_OFF(LED3_GPIO_Port, LED3_Pin);
+}

@@ -18,7 +18,11 @@
 /* USER CODE END Header */
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "adc.h"
+#include "comp.h"
+#include "dac.h"
 #include "hrtim.h"
+#include "tim.h"
 #include "usart.h"
 #include "gpio.h"
 
@@ -26,7 +30,11 @@
 /* USER CODE BEGIN Includes */
 #include "arm_math.h"
 #include "io_retarget.h"
+#include <iso646.h>
 #include <stdio.h>
+#include "freq_skip.h"
+#include "fault_log.h"
+#include "vout_adc.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -47,6 +55,22 @@
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
+
+const uint16_t sine_table[64] = {
+     931,1022,1112,1201,1287,1370,1448,1522,
+    1589,1650,1705,1752,1791,1822,1844,1857,
+    1861,1857,1844,1822,1791,1752,1705,1650,
+    1589,1522,1448,1370,1287,1201,1112,1022,
+     931, 840, 750, 661, 575, 492, 414, 340,
+     273, 212, 157, 110,  71,  40,  18,   5,
+       0,   5,  18,  40,  71, 110, 157, 212,
+     273, 340, 414, 492, 575, 661, 750, 840
+};
+
+
+
+
+
 
 /* USER CODE END PV */
 
@@ -91,15 +115,56 @@ int main(void)
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_HRTIM1_Init();
+  MX_DAC1_Init();
+  MX_ADC1_Init();
+  MX_COMP2_Init();
+  MX_COMP4_Init();
+  MX_COMP6_Init();
+  MX_DAC2_Init();
+  MX_DAC4_Init();
+  MX_ADC2_Init();
   MX_USART1_UART_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-  // 禁用Fault，清除上电误触发
-  HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_DISABLED);
-//HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_6, HRTIM_FAULTMODECTL_DISABLED);
-//HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT6C;
-HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C;
 
-// 启动PWM输出
+  /* 关闭 stdout 缓冲：裸机 newlib 默认全缓冲，\n 不 flush，会导致"串口没输出"。
+     设为无缓冲后每个字符立即经 USART3 发出。*/
+  setvbuf(stdout, NULL, _IONBF, 0);
+  printf("\r\n[BOOT] G474_HRTIM start, USART3 115200 8N1\r\n");
+
+//   // 禁用Fault，清除上电误触发
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_DISABLED);
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_2, HRTIM_FAULTMODECTL_DISABLED);
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_3, HRTIM_FAULTMODECTL_DISABLED);
+HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT2C|HRTIM_ICR_FLT3C;
+
+
+
+
+HAL_COMP_Start(&hcomp2);
+HAL_DAC_Start(&hdac1,DAC1_CHANNEL_2 );
+HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, 2480);
+HAL_COMP_Start(&hcomp4);
+HAL_DAC_Start(&hdac1,DAC1_CHANNEL_1 );
+HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+HAL_COMP_Start(&hcomp6);
+HAL_DAC_Start(&hdac4,DAC1_CHANNEL_2 );
+HAL_DAC_SetValue(&hdac4, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, 2048);
+
+
+// // 等待dac上拉稳定
+HAL_Delay(1);
+
+
+// // 清除延迟期间可能产生的误触发
+HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT2C|HRTIM_ICR_FLT3C;
+
+// // 重新使能Fault 1
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_ENABLED);
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_2, HRTIM_FAULTMODECTL_ENABLED);
+HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_3, HRTIM_FAULTMODECTL_ENABLED);
+
+// // 启动PWM输出
 HAL_HRTIM_WaveformOutputStart(&hhrtim1,
     HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
     HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
@@ -109,16 +174,25 @@ HAL_HRTIM_WaveformCountStart(&hhrtim1,
     HRTIM_TIMERID_TIMER_A |
     HRTIM_TIMERID_TIMER_C);
 
-// 等待PC10上拉稳定
-HAL_Delay(1);
+//开始软启动
+LLC_SoftStart_Init();
 
-// 清除延迟期间可能产生的误触发
-// HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT6C;
-HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C;
-// 重新使能Fault 6
-HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_ENABLED);
-//HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_6, HRTIM_FAULTMODECTL_ENABLED);
-char buf[64];
+// 使能 HRTIM 故障中断（FLT1/2/3），发生过流/过压时软件记录并锁死
+Fault_IRQ_Enable();
+
+// 启动 VOUT 采样：ADC1 自校准 + TIM3 10kHz 周期中断软件触发，结果存 g_vout_raw/g_vout_mv
+VOUT_ADC_Init();
+
+// HAL_TIM_Base_Start(&htim3);
+
+// HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, 
+//                    (uint32_t*)sine_table, 64, 
+//                    DAC_ALIGN_12B_R);
+//验证运放Gain=2时，100KSINE波形是否失真
+//HAL_OPAMP_Start(&hopamp1);
+
+
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -128,12 +202,10 @@ char buf[64];
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    sprintf(buf, "ISR=0x%08lX PA12=%d PC10=%d\r\n",
-    HRTIM1->sCommonRegs.ISR,
-    (GPIOA->IDR >> 12) & 1,
-    (GPIOC->IDR >> 10) & 1);
-    HAL_UART_Transmit(&huart1,buf, sizeof(buf), 100);
-    HAL_Delay(200);
+    Fault_Report_Poll();
+
+  
+
     
   }
   /* USER CODE END 3 */
@@ -155,11 +227,12 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
-  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
+  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
+  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV3;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
   RCC_OscInitStruct.PLL.PLLN = 85;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;

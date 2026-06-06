@@ -22,7 +22,11 @@ set(MX_Include_Dirs
 set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/main.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/gpio.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/adc.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/comp.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/dac.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/hrtim.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/tim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/usart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/stm32g4xx_it.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/stm32g4xx_hal_msp.c
@@ -34,7 +38,9 @@ set(MX_Application_Src
 # STM32 HAL/LL Drivers
 set(STM32_Drivers_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/system_stm32g4xx.c
-    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_hrtim.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_adc_ex.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_ll_adc.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_rcc.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_rcc_ex.c
@@ -48,6 +54,12 @@ set(STM32_Drivers_Src
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_pwr_ex.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_cortex.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_comp.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac_ex.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_hrtim.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim_ex.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart_ex.c
 )
