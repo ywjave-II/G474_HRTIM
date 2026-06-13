@@ -1,7 +1,8 @@
 #include "fault_log.h"
 #include "freq_skip.h"     /* llc_period / softstart_done，用于打印实际开关频率 */
-#include "vout_adc.h"      /* g_vout_raw / g_vout_mv，用于打印 VOUT 采样 */
-#include <stdio.h>         /* printf -> USART3（io_retarget.c 重定向）*/
+#include "vaux_adc.h"      /* g_vaux_raw / g_vaux_mv，用于打印辅助电源采样 */
+#include "safe_sm.h"       /* g_safe_state，打印安全状态机当前状态 */
+#include <stdio.h>         /* printf -> USART1（io_retarget.c 重定向）*/
 
 /* 等效计数时钟：HRTIM MUL32，5440 MHz。fsw = 5440e6 / period */
 #define HRTIM_EQUIV_CLK_HZ   5440000000ULL
@@ -37,7 +38,7 @@ void Fault_OnIRQ(void)
 {
     /* 注意：__HAL_HRTIM_GET_ITSTATUS 在本 HAL 版本只查 IER（是否使能），
      * 不查 ISR。要判断"哪一路真的触发"必须用 __HAL_HRTIM_GET_FLAG 读 ISR。*/
-
+    //HAL_GPIO_WritePin(GPIOA,GPIO_PIN_12,GPIO_PIN_SET);
     if (__HAL_HRTIM_GET_FLAG(&hhrtim1, HRTIM_FLAG_FLT1))
     {
         __HAL_HRTIM_CLEAR_FLAG(&hhrtim1, HRTIM_FLAG_FLT1);
@@ -80,27 +81,27 @@ void Fault_Report_Poll(void)
         const char *src;
         switch (g_fault.last_fault)
         {
-            case FAULT_FLT1: src = "FLT1  COMP2/PA3  (DAC1_CH2 阈值)"; break;
-            case FAULT_FLT2: src = "FLT2  COMP4/PB0  (DAC1_CH1 阈值)"; break;
-            case FAULT_FLT3: src = "FLT3  COMP6/PB11 (DAC4_CH2 阈值)"; break;
+            case FAULT_FLT1: src = "FLT1  COMP2/PA3  (DAC1_CH2 REF)"; break;
+            case FAULT_FLT2: src = "FLT2  COMP4/PB0  (DAC1_CH1 REF)"; break;
+            case FAULT_FLT3: src = "FLT3  COMP6/PB11 (DAC4_CH2 REF)"; break;
             default:         src = "NONE";                             break;
         }
 
         printf("\r\n==== HRTIM FAULT TRIGGER! (OCP/OVP, PWM LOCK) ====\r\n");
-        printf("  最近触发 : %s\r\n", src);
-        printf("  触发时刻 : %lu ms\r\n", (unsigned long)g_fault.last_tick);
-        printf("  各路次数 : FLT1=%lu  FLT2=%lu  FLT3=%lu  总计=%lu\r\n",
+        printf("  LAST TRIGGER : %s\r\n", src);
+        printf("  TRIGGER TIME: %lu ms\r\n", (unsigned long)g_fault.last_tick);
+        printf("  FAULT COUNT : FLT1=%lu  FLT2=%lu  FLT3=%lu  总计=%lu\r\n",
                (unsigned long)g_fault.flt1_cnt,
                (unsigned long)g_fault.flt2_cnt,
                (unsigned long)g_fault.flt3_cnt,
                (unsigned long)g_fault.total_cnt);
-        printf("  锁死标志 : tripped=%u （需排除故障源后调用 Fault_Rearm() 恢复）\r\n",
+        printf("  LOCK FLAG : tripped=%u （FIND OUT PROBRAM THEN  Fault_Rearm() TO RESTART\r\n",
                g_fault.tripped);
 
         uint32_t per = llc_period;
         if (per)
         {
-            printf("  故障瞬时 : period=%lu, fsw=%lu Hz\r\n",
+            printf("  FAULT OCCURRED : period=%lu, fsw=%lu Hz\r\n",
                    (unsigned long)per,
                    (unsigned long)(HRTIM_EQUIV_CLK_HZ / per));
         }
@@ -114,14 +115,20 @@ void Fault_Report_Poll(void)
     {
         last_hb = now;
         uint32_t per = llc_period;
-        printf("[STAT] period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu | VOUT raw=%u (%u mV)\r\n",
+        static const char *const st_name[] = {
+            "INIT", "WAIT_AUX", "SOFTSTART", "RUN", "FAULT"
+        };
+        safe_state_t st = g_safe_state;
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu | VAUX raw=%u filt=%u (%u mV)\r\n",
+               (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,
                g_fault.tripped,
                (unsigned long)g_fault.total_cnt,
-               g_vout_raw,
-               g_vout_mv);
+               g_vaux_raw,
+               g_vaux_filt,
+               g_vaux_mv);
     }
 
     /* ---- 3) 软启动完成后打印一次 Timer A / Timer C 关键寄存器，定位 260k 问题 ----

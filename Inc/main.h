@@ -69,6 +69,8 @@ void Error_Handler(void);
 #define IOU_GPIO_Port GPIOC
 #define I_CYCLE_Pin GPIO_PIN_2
 #define I_CYCLE_GPIO_Port GPIOB
+#define DIS_Pin GPIO_PIN_12
+#define DIS_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 

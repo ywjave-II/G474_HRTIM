@@ -20,10 +20,16 @@ void LLC_SoftStart_Init(void)
         HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
         HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
 
+    // HAL_HRTIM_WaveformCountStart(&hhrtim1,
+    //     HRTIM_TIMERID_MASTER |
+    //     HRTIM_TIMERID_TIMER_A |
+    //     HRTIM_TIMERID_TIMER_C);
+
+    //软启动开机时刻不开TIMER C 同步整流驱动。
     HAL_HRTIM_WaveformCountStart(&hhrtim1,
         HRTIM_TIMERID_MASTER |
-        HRTIM_TIMERID_TIMER_A |
-        HRTIM_TIMERID_TIMER_C);
+        HRTIM_TIMERID_TIMER_A );
+
 }
 
 void LLC_SoftStart_Step(void)
@@ -44,10 +50,11 @@ void LLC_SoftStart_Step(void)
             softstart_done = 1;
         }
 
-        HRTIM1->sMasterRegs.MPER = llc_period;
+        
         HRTIM1->sTimerxRegs[0].PERxR = llc_period;
         HRTIM1->sTimerxRegs[2].PERxR = llc_period;
         HRTIM1->sTimerxRegs[2].CMP1xR = llc_period / 2;       // 相位偏移跟随
         HRTIM1->sTimerxRegs[2].CMP4xR = llc_period - 342;     // 关断点跟随
+        HRTIM1->sMasterRegs.MPER = llc_period;
     }
 }

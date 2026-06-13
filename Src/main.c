@@ -34,7 +34,8 @@
 #include <stdio.h>
 #include "freq_skip.h"
 #include "fault_log.h"
-#include "vout_adc.h"
+#include "vaux_adc.h"
+#include "safe_sm.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -127,10 +128,18 @@ int main(void)
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
-  /* 关闭 stdout 缓冲：裸机 newlib 默认全缓冲，\n 不 flush，会导致"串口没输出"。
-     设为无缓冲后每个字符立即经 USART3 发出。*/
+  /* ---- INIT：复位后第一件事，强制封波 + DIS 失能，杜绝重启窗口出现 PWM ---- */
+  SafeSM_Init();                 /* HRTIM 输出 inactive + DIS=SET(失能) + 状态归 WAIT_AUX */
+  SafeSM_ConfigBrownout();       /* MCU 自身 PVD 欠压预警（BOR 见 safe_sm.c 顶部，为 option byte）*/
+
+  /* 启动辅助电源(VAUX：原 VOUT/PA1 已飞线改接 24V 轨)采样：ADC1 自校准 + TIM3 10kHz */
+  VAUX_ADC_Init();
+
+  /* 关闭 stdout 缓冲：裸机 newlib 默认全缓冲，\n 不 flush，会导致"串口没输出"。*/
   setvbuf(stdout, NULL, _IONBF, 0);
-  printf("\r\n[BOOT] G474_HRTIM start, USART3 115200 8N1\r\n");
+  printf("\r\n[BOOT] G474_HRTIM start, USART1 115200 8N1\r\n");
+  printf("[BOOT] safe-reentry armed: wait VAUX>=%umV stable before PWM\r\n",
+         (unsigned)VAUX_REARM_MV);
 
 //   // 禁用Fault，清除上电误触发
 HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_DISABLED);
@@ -143,13 +152,15 @@ HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT2C|HRTIM_ICR_FLT3C;
 
 HAL_COMP_Start(&hcomp2);
 HAL_DAC_Start(&hdac1,DAC1_CHANNEL_2 );
-HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, 2480);
+/* COMP2(PA3, IN+=VAUX 分压) 阈值改为 VAUX 欠压闸 21V(≈2606 码)。配合 HRTIM Fault1
+ * 「低有效 + latched」(CubeMX 配置)：COMP 输出低=VAUX<21V=故障，硬件纳秒级封死 PWM。*/
+HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, VAUX_HW_TRIP_DAC);
 HAL_COMP_Start(&hcomp4);
 HAL_DAC_Start(&hdac1,DAC1_CHANNEL_1 );
-HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 2048);
+HAL_DAC_SetValue(&hdac1, DAC1_CHANNEL_1, DAC_ALIGN_12B_R, 3500);
 HAL_COMP_Start(&hcomp6);
 HAL_DAC_Start(&hdac4,DAC1_CHANNEL_2 );
-HAL_DAC_SetValue(&hdac4, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, 2048);
+HAL_DAC_SetValue(&hdac4, DAC1_CHANNEL_2, DAC_ALIGN_12B_R, 3500);
 
 
 // // 等待dac上拉稳定
@@ -164,24 +175,16 @@ HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_ENABLED);
 HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_2, HRTIM_FAULTMODECTL_ENABLED);
 HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_3, HRTIM_FAULTMODECTL_ENABLED);
 
-// // 启动PWM输出
-HAL_HRTIM_WaveformOutputStart(&hhrtim1,
-    HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
-    HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
 
-HAL_HRTIM_WaveformCountStart(&hhrtim1,
-    HRTIM_TIMERID_MASTER |
-    HRTIM_TIMERID_TIMER_A |
-    HRTIM_TIMERID_TIMER_C);
-
-//开始软启动
-LLC_SoftStart_Init();
-
-// 使能 HRTIM 故障中断（FLT1/2/3），发生过流/过压时软件记录并锁死
+/* 使能 HRTIM 故障中断（FLT1=VAUX 欠压, FLT2/3=OCP/OVP），触发时软件记录并锁死。
+ * 注意：此处【不】启动 PWM、【不】使能 DIS、【不】调 LLC_SoftStart_Init —— 这些全部推迟到
+ * 安全状态机 WAIT_AUX→SOFTSTART（确认 VAUX≥23V 稳定后）才执行，杜绝重启窗口误开通。
+ * 若上电时 VAUX<21V，FLT1(低有效) 会立即锁存，属预期；SM 启动时再统一清除。
+ * PWM 启动序列(WaveformOutputStart + CountStart(MASTER|TIMER_A) + 使能 DIS + LLC_SoftStart_Init)
+ * 现由 safe_sm.c 的 SafeSM_Poll() 在 WAIT_AUX→SOFTSTART 转移里完成。*/
 Fault_IRQ_Enable();
 
-// 启动 VOUT 采样：ADC1 自校准 + TIM3 10kHz 周期中断软件触发，结果存 g_vout_raw/g_vout_mv
-VOUT_ADC_Init();
+
 
 // HAL_TIM_Base_Start(&htim3);
 
@@ -202,11 +205,8 @@ VOUT_ADC_Init();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    Fault_Report_Poll();
-
-  
-
-    
+    SafeSM_Poll();          /* 安全状态机：WAIT_AUX/SOFTSTART/RUN/FAULT 转移 + PVD 轮询 */
+    Fault_Report_Poll();    /* 串口诊断：故障详情 + [STAT] 心跳 + [REGS] 一次性寄存器 dump */
   }
   /* USER CODE END 3 */
 }
@@ -227,12 +227,11 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
-  RCC_OscInitStruct.HSIState = RCC_HSI_ON;
-  RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.HSEState = RCC_HSE_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
-  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSI;
-  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV4;
+  RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
+  RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV3;
   RCC_OscInitStruct.PLL.PLLN = 85;
   RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
   RCC_OscInitStruct.PLL.PLLQ = RCC_PLLQ_DIV2;

@@ -20,7 +20,7 @@ extern "C" {
 
 /* Exported functions prototypes ------------------------------------*/
 
-float DRIVER_Run(float ref, float fb);
+void DRIVER_LATCH();
 
 
 #ifdef __cplusplus

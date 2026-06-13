@@ -3,6 +3,18 @@
 volatile uint16_t g_vout_raw = 0;
 volatile uint16_t g_vout_mv  = 0;
 
+/* ============================================================================
+ * 【已停用 / 保留备用】2026-06-12：原 VOUT(PA1) 采样路已飞线改接辅助电源 24V 轨，
+ * 由 App/vaux_adc.c 接管（ADC1/PA1/TIM3 同一硬件，语义改为 VAUX）。
+ *
+ * 下面两个函数用 #if 0 关闭，原因：
+ *   1) HAL_TIM_PeriodElapsedCallback 是 HAL 的 __weak 单例回调，全工程只能有一处实现；
+ *      vaux_adc.c 已重新实现它，这里若一起编译会重复定义导致链接报错。
+ *   2) VOUT_ADC_Init 已被 VAUX_ADC_Init 取代（同样启动 TIM3 10kHz），不再调用。
+ * 全局变量 g_vout_raw/g_vout_mv 保留定义（占用极小，便于以后恢复）。
+ * 恢复方法：移除/停用 vaux_adc.c 后，把下面的 #if 0 / #endif 删掉即可。
+ * ==========================================================================*/
+#if 0
 void VOUT_ADC_Init(void)
 {
     /* ADC 单端自校准：必须在第一次启动转换之前做一次，提升精度 */
@@ -48,3 +60,4 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     HAL_ADC_Stop(&hadc1);
 }
+#endif /* 已停用：见文件上方说明 */
