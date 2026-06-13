@@ -48,8 +48,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         uint16_t filt = (uint16_t)(acc >> VAUX_FILT_SHIFT);
         g_vaux_filt = filt;
 
-        /* 喂给安全状态机：内部做「已断透 latch」更新 + 22V 软件欠压立即封波。
-         * 整数、确定性、短路径。*/
+        /* 喂给安全状态机：22V 软件欠压立即封波。整数、确定性、短路径。*/
         SafeSM_OnSample(filt);
 
         /* 串口显示用：引脚电压 -> 分压还原 -> 标定。浮点仅此处，非封波路径。*/

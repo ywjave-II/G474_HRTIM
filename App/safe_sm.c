@@ -21,9 +21,6 @@
 
 volatile safe_state_t g_safe_state = SAFE_INIT;
 
-/* 「确认真的断透」latch：VAUX 曾跌破 VAUX_CLEAR(5V) 才置 1。重启互锁的必要条件。*/
-static volatile uint8_t aux_dropped_latch = 0;
-
 /* WAIT_AUX 中 VAUX 持续高于 REARM 的计时起点 */
 static uint8_t  aux_ok_timing = 0;
 static uint32_t aux_ok_t0     = 0;
@@ -66,11 +63,10 @@ static void SafeSM_EnsureBOR(void)
 void SafeSM_Init(void)
 {
     /* INIT：复位后、启动任何 PWM 之前的第一件事 —— 默认就「不输出」。*/
-    aux_dropped_latch = 0;
     aux_ok_timing     = 0;
 
     HAL_HRTIM_WaveformOutputStop(&hhrtim1, SAFE_OUT_ALL);   /* 输出强制 inactive */
-    HALF_BRIDGE_DISABLE();                                  /* DIS 失能（释放 PA12，由上拉钳高 DIS）*/
+    HALF_BRIDGE_DISABLE();                                  /* DIS 失能（PA12 直驱拉高 = DIS 高 = 失能）*/
 
     /* 先封波再处理 BOR：BOR 若需编程会在此触发系统复位（首启一次），复位后重新进来跳过。*/
     SafeSM_EnsureBOR();
@@ -91,14 +87,8 @@ void SafeSM_ConfigBrownout(void)
 
 void SafeSM_OnSample(uint16_t vaux_code)
 {
-    /* 1) 「已断透」latch：一旦真正跌破 5V 即记住（重启互锁条件 a）*/
-    if (vaux_code < VAUX_CLEAR_CODE)
-    {
-        aux_dropped_latch = 1;
-    }
-
-    /* 2) 软件立即封波：仅在已输出(SOFTSTART/RUN)时跌破 22V 才动作。
-     *    WAIT_AUX/INIT/FAULT 本就封波，不重复触发。整数短路径。*/
+    /* 软件立即封波：仅在已输出(SOFTSTART/RUN)时跌破 22V 才动作。
+     * WAIT_AUX/INIT/FAULT 本就封波，不重复触发。整数短路径。*/
     if (vaux_code < VAUX_SW_TRIP_CODE)
     {
         if (g_safe_state == SAFE_SOFTSTART || g_safe_state == SAFE_RUN)
@@ -183,12 +173,14 @@ void SafeSM_Poll(void)
             break;
 
         case SAFE_FAULT:
-            /* 重启互锁：必须 (a)曾断透(<5V) 且 (b)回升稳定到 REARM，才回 WAIT_AUX。
-             * 仅在 22~23V 抖动不得触发重启。回 WAIT_AUX 后由其完成「清锁存+重走软启动」。*/
-            if (aux_dropped_latch && (g_vaux_filt >= VAUX_REARM_CODE))
+            /* 重启条件：VAUX 回升到 REARM(23V) 即回 WAIT_AUX，由其完成「稳定50ms自检
+             * → 清 HRTIM 锁存故障 → 重走完整 SOFTSTART」。真正断透时 MCU 与 UCC21520 VCCI
+             * 共用同一供电链(24V→DCDC→5V→LDO→3.3V)，必随之掉电，下次为冷上电从 INIT 天然
+             * 安全重入，软件不再模拟「断透确认」。仅在 22~23V 抖动够不到 REARM → 停在 FAULT，
+             * 靠 HRTIM 锁存故障保持封波，不自动重启。*/
+            if (g_vaux_filt >= VAUX_REARM_CODE)
             {
-                aux_dropped_latch = 0;
-                g_safe_state      = SAFE_WAIT_AUX;
+                g_safe_state = SAFE_WAIT_AUX;
             }
             break;
 

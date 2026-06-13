@@ -11,8 +11,8 @@
 > **2026-06-12 进展（v5）—— 辅助电源安全监测 + 安全重入**：原 VOUT(ADC1/PA1) 采样路**飞线改接
 > 辅助电源 24V 轨**，语义由 VOUT 改为 **VAUX**（`vout_adc`→`vaux_adc`，旧文件 `#if 0` 停用保留）；
 > 新增 **安全重入状态机** `App/safe_sm.c`（INIT→WAIT_AUX→SOFTSTART→RUN→FAULT）消除"辅源衰减期重启
-> 误开通半桥"隐患：上电默认封波 + DIS 失能，必须 VAUX≥23V 稳定才启 PWM，且"曾断透(<5V)+回升"
-> 才允许重启；软件 22V 优雅封波 + COMP2/FLT1 硬件 21V 低有效锁存兜底；新增 **PVD(代码)** 与
+> 误开通半桥"隐患：上电默认封波 + DIS 失能，必须 VAUX≥23V 稳定才启 PWM（FAULT 后亦须 VAUX≥23V
+> 才重启）；软件 22V 优雅封波 + COMP2/FLT1 硬件 21V 低有效锁存兜底；新增 **PVD(代码)** 与
 > **BOR(代码自动配置 option byte，无需外部工具)** MCU 自保护。详见 §5c。
 >
 > **2026-06-13 校订（v6）—— CubeMX 待办全部落地 + 参数对齐源码**：§5c 原列的 CubeMX 待办已在
@@ -329,8 +329,12 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 |---|---|---|---|
 | `VAUX_SW_TRIP_MV` | 22.0 V | ADC 2730 | 软件检测：跌破→优雅封波+记 log+进 FAULT |
 | `VAUX_HW_TRIP_MV` | 21.0 V | DAC 2606 | 硬件 COMP2/DAC1_CH2 闸（比软件低一档，软件优先、硬件兜底）|
-| `VAUX_REARM_MV` | 23.0 V | ADC 2854 | 迟滞回升点；须稳定 `VAUX_STABLE_MS`(50ms) 才放行 |
-| `VAUX_CLEAR_MV` | 5.0 V | ADC 620 | "确认真的断透"门限(< UCC21520A VDD_OFF max 6.0V 留裕量) |
+| `VAUX_REARM_MV` | 23.0 V | ADC 2854 | 迟滞回升点；须稳定 `VAUX_STABLE_MS`(50ms) 才放行重启 |
+
+> **2026-06-13/v6 移除「断透 latch」重启互锁**：原 `VAUX_CLEAR_MV`(5V)「确认断透」门限 + `aux_dropped_latch`
+> 标志已删除。原因：MCU 与 UCC21520 VCCI 共用同一供电链（24V→DCDC(4~30V)→5V→①LDO→3.3V MCU；②5V VCCI），
+> VAUX 真正断透时 MCU 必然掉电、下次为冷上电从 INIT 天然安全重入，「跌破 5V 才确认断透」MCU 根本活不到执行，
+> 是存不住的死逻辑。现重启条件仅为 **VAUX 回升≥REARM(23V) 且 WAIT_AUX 稳定 50ms 自检通过**。
 
 **分层防护（由软到硬，互为兜底）**：
 1. **软件优雅封波**：10kHz ISR(`vaux_adc.c`) 读 VAUX → 一阶 EWMA(α=1/8,τ≈0.8ms) → `SafeSM_OnSample()`；
@@ -347,11 +351,11 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 
 | 状态 | 进入/动作 | 转出条件 |
 |---|---|---|
-| INIT | 复位后第一件事：HRTIM 输出 inactive + **DIS 失能(PA12=SET)** + 复位 latch + 首启配 BOR | 立即→WAIT_AUX |
+| INIT | 复位后第一件事：HRTIM 输出 inactive + **DIS 失能(PA12=SET)** + 首启配 BOR | 立即→WAIT_AUX |
 | WAIT_AUX | 保持封波等辅源 | VAUX≥23V 且稳定 50ms → 清锁存故障 + DIS 使能 + `LLC_SoftStart_Init()` → SOFTSTART |
 | SOFTSTART | 复用现有 300k→139.5k 扫频（不重写）| `softstart_done`→RUN；`g_fault.tripped`→FAULT |
 | RUN | 开环定频运行 | 任何 `g_fault.tripped` 或 22V/PVD → FAULT |
-| FAULT | 封波 + DIS 失能，停留 | **重启互锁**：曾断透(<5V latch) **且** 回升≥23V → WAIT_AUX（再走完整软启动，严禁直接 RUN）|
+| FAULT | 封波 + DIS 失能，停留 | VAUX 回升≥23V(REARM) → WAIT_AUX（由其稳定50ms自检+清锁存+重走完整软启动，严禁直接 RUN）。真正断透由 MCU 掉电冷启动从 INIT 自然处理 |
 
 **关键点**：
 - PWM 启动序列（`WaveformOutputStart`+`CountStart`+`LLC_SoftStart_Init`+DIS 使能）**全部从 main 移到
@@ -360,15 +364,18 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 - `SafeSM_EnterFault()` 幂等，可从 ISR/主循环任意调用。
 - `[STAT]` 心跳增打 `state=` 与 `VAUX raw/filt/mV`。
 
-**✅ 已完成（软件层，2026-06-12）—— DIS 控制极性反相**：
-硬件改动：DIS 原经 7.5K 下拉"默认使能"，改为 VCCI(5V) 经 ~10K 上拉"默认失能"；MCU 仍经 2N7002 驱动。
-软件适配（4 处，仅此 4 处）：
-- `App/safe_sm.h:52-57`：宏反转：`ENABLE=RESET`(导通 2N7002 拉低 DIS)，`DISABLE=SET`(关断 2N7002→上拉钳高)
-- `App/safe_sm.c:73`：尾注释更新
-- `Src/gpio.c:56-57`：上电默认电平 RESET→**SET**（上电即失能），消除 MX_GPIO_Init 到 SafeSM_Init 的窗口
-- `Src/gpio.c:66-69`：`GPIO_PULLUP`→`GPIO_NOPULL`（外部上拉已保证默认态，MCU 不干预）
-行为：复位/INIT/WAIT_AUX/SOFTSTART/FAULT 一律失能；仅 RUN 主动使能；enter_fault() 内失能。安全默认：GPIO
-高阻/复位/掉电时外部上拉自然将 DIS 钳在失能态，驱动不误开通。
+**✅ 已完成 / 实测验证（DIS 控制，2026-06-13 终态）—— PA12 IO 直驱 DIS（已去掉 2N7002）**：
+硬件演进：原设计经 2N7002 反相驱动（曾为此在 v5 反转过软件宏）；**调试中已拆除 2N7002，改为 PA12
+直接驱动 UCC21520A 的 DIS 脚**（非反相，PA12 电平 = DIS 电平）。直驱后无反相环节，现有软件极性
+（`ENABLE=RESET`、`DISABLE=SET`）**恰好正确，无需再改**：
+- `App/safe_sm.h:54-55`：`HALF_BRIDGE_ENABLE()=RESET(低)` → DIS 低 = 使能；`DISABLE()=SET(高)` → DIS 高 = 失能。
+- `Src/gpio.c:57`：上电默认 `SET(高)=失能`（安全默认，消除 MX_GPIO_Init→SafeSM_Init 窗口）；`gpio.c:69` `NOPULL`。
+- `App/safe_sm.c`：复位/INIT/WAIT_AUX/SOFTSTART/FAULT 一律失能(PA12 高)；仅 RUN 主动使能(PA12 低)；`SafeSM_EnterFault()` 内失能。
+- ⚠️ 注意安全默认前提变化：拆 2N7002 后，**掉电/复位/GPIO 高阻时 DIS 不再被外部上拉钳在失能态**——
+  现靠 MCU GPIO 上电即 `SET` + UCC21520A 自身 DIS 引脚特性兜底；若需"MCU 失电也强制失能"，应在 DIS 网络保留一只对 VCCI 的上拉电阻。
+
+**实测验证（直流源 0.1V 步进）**：VAUX **>23.1V → PA12=0V（使能）**；VAUX **<22V → PA12=3.3V（失能）**。
+正好落在固件迟滞带 `REARM(23V)`↔`SW_TRIP(22V)` 内，逻辑确认正确。
 
 **✅ 已完成（CubeMX 已改并重新生成，2026-06-13/v6）**：
 1. ✅ **HRTIM Fault1 → 低有效 + 锁存**：`hrtim.c:50` `Polarity=HRTIM_FAULTPOLARITY_LOW`；`hrtim.c:51`
@@ -441,12 +448,12 @@ G474_HRTIM/
 > - UART(USART1) 调试 + DSP 库集成 ✓
 >
 > - **辅源安全监测 + 安全重入**（v5/v6）：VAUX 采样(原 VOUT 飞线) + 软件 22V 优雅封波 + COMP2/FLT1 硬件
->   21V 低有效兜底 + 状态机(INIT→WAIT_AUX→SOFTSTART→RUN→FAULT) + 重启互锁 + PVD/BOR ✓
+>   21V 低有效兜底 + 状态机(INIT→WAIT_AUX→SOFTSTART→RUN→FAULT) + VAUX≥23V 重启 + PVD/BOR ✓
 >   **CubeMX 待办已全部落地**（Fault1=LOW+Filter_9、COMP2=40MV、DIS 默认 SET）✓（v6）
 >
 > **下一步**：
 > 1. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `VAUX_CAL_GAIN/OFFSET`；
->    实测确认 22V 软封波、21V 硬封波、23V 重启、5V 断透各门限动作正确。
+>    实测确认 22V 软封波、21V 硬封波、23V 重启各门限动作正确。
 > 2. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——消除原 OCP/OVP 噪声误触发。
 > 3. **闭环**：反馈 → 主循环/定时中断跑 PID/`DRIVER_Run` → 动态调 HRTIM 周期（PFM 调压）；启动 IOU/I_CYCLE(ADC2)。
-> 4. 可选：给 `Fault_Rearm()`/重启互锁 加串口指令触发入口。
+> 4. 可选：给 `Fault_Rearm()`/重启流程 加串口指令触发入口。

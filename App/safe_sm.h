@@ -34,12 +34,10 @@ extern "C" {
 #define VAUX_SW_TRIP_MV   22000U   /* 软件检测：跌破即优雅封波 + 记 log + 进 FAULT */
 #define VAUX_HW_TRIP_MV   21000U   /* 硬件 COMP/DAC 闸：比软件低一档，软件优先、硬件兜底 */
 #define VAUX_REARM_MV     23000U   /* 迟滞回升点：回到此值并稳定才允许重启 */
-#define VAUX_CLEAR_MV      5000U   /* 「确认真的断透」门限(< VDD_OFF max 6.0V，留裕量) */
 
 /* 由上面伏特值换算出的 ADC 码 / DAC 码（注释为标称值，宏保证与换算同源）*/
 #define VAUX_SW_TRIP_CODE   VAUX_MV_TO_CODE(VAUX_SW_TRIP_MV)  /* 22V -> 引脚2.20V -> ADC码≈2730 */
 #define VAUX_REARM_CODE     VAUX_MV_TO_CODE(VAUX_REARM_MV)    /* 23V -> 引脚2.30V -> ADC码≈2854 */
-#define VAUX_CLEAR_CODE     VAUX_MV_TO_CODE(VAUX_CLEAR_MV)    /*  5V -> 引脚0.50V -> ADC码≈620  */
 #define VAUX_HW_TRIP_DAC    VAUX_MV_TO_CODE(VAUX_HW_TRIP_MV)  /* 21V -> 引脚2.10V -> DAC码≈2606 */
 
 /* VAUX 回升到 REARM 之上需稳定保持的时长(ms)，再放行重启，抗回升毛刺 */
@@ -49,20 +47,21 @@ extern "C" {
  * 仅监测 MCU 自身 VDD(3.3V)，与 24V 辅源无关；BOR 在 option byte 配置（见 .c 与 CLAUDE.md）。*/
 #define SAFE_PVD_LEVEL      PWR_PVDLEVEL_6
 
-/* ---- DIS（UCC21520A 失能脚 = PA12，经 2N7002 驱动）----
- * 硬件：DIS 被 VCCI(5V) 经 ~10K 上拉「默认失能」；MCU GPIO 经 2N7002 主动拉低 DIS→使能。
- * 语义：RESET(低)=导通 2N7002 拉低 DIS→使能驱动；SET(高)/高阻=关断 2N7002→上拉钳高 DIS→失能。
- * 安全默认：GPIO 高阻/复位/掉电时，上拉自然将 DIS 钳在失能态，驱动不误开通。*/
+/* ---- DIS（UCC21520A 失能脚 = PA12，PA12 IO 直驱，已拆除 2N7002）----
+ * 硬件：PA12 直接接 UCC21520A 的 DIS 脚（非反相，PA12 电平=DIS 电平）。
+ * 语义：RESET(低)=DIS 低=使能驱动；SET(高)=DIS 高=失能。上电默认 SET(高)=失能（见 gpio.c）。
+ * 实测(0.1V 步进)：VAUX>23.1V→PA12=0V 使能；VAUX<22V→PA12=3.3V 失能，落在 REARM↔SW_TRIP 迟滞带内。
+ * ⚠️ 拆 2N7002 后掉电/高阻时 DIS 不再有外部上拉钳失能态；如需 MCU 失电也强制失能，DIS 网络应留对 VCCI 上拉。*/
 #define HALF_BRIDGE_ENABLE()   HAL_GPIO_WritePin(DIS_GPIO_Port, DIS_Pin, GPIO_PIN_RESET)
 #define HALF_BRIDGE_DISABLE()  HAL_GPIO_WritePin(DIS_GPIO_Port, DIS_Pin, GPIO_PIN_SET)
 
 /* ---- 状态机 ---- */
 typedef enum {
-    SAFE_INIT = 0,    /* 复位后：强制封波 + DIS 失能 + 复位 latch（启动任何 PWM 之前）*/
+    SAFE_INIT = 0,    /* 复位后：强制封波 + DIS 失能（启动任何 PWM 之前）*/
     SAFE_WAIT_AUX,    /* 等辅源 ≥ REARM 且稳定，期间保持封波 */
     SAFE_SOFTSTART,   /* 复用现有 300k->140k 扫频软启动 */
     SAFE_RUN,         /* 扫频结束开环定频运行 */
-    SAFE_FAULT        /* 封波 + DIS 失能，停留；仅满足重启互锁才回 WAIT_AUX */
+    SAFE_FAULT        /* 封波 + DIS 失能，停留；VAUX 回升到 REARM 即回 WAIT_AUX 重启 */
 } safe_state_t;
 
 extern volatile safe_state_t g_safe_state;
@@ -75,7 +74,7 @@ void SafeSM_Init(void);
  * BOR 为 option byte，见 .c 顶部说明，需用 STM32CubeProgrammer 一次性烧写。*/
 void SafeSM_ConfigBrownout(void);
 
-/* 10kHz ISR 调用（vaux_adc.c 内）：更新「已断透」latch + 22V 软件欠压立即封波。
+/* 10kHz ISR 调用（vaux_adc.c 内）：22V 软件欠压立即封波。
  * 整数、短路径、可重入安全。*/
 void SafeSM_OnSample(uint16_t vaux_code);
 

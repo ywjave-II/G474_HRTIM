@@ -186,16 +186,6 @@ Fault_IRQ_Enable();
 
 
 
-// HAL_TIM_Base_Start(&htim3);
-
-// HAL_DAC_Start_DMA(&hdac1, DAC_CHANNEL_1, 
-//                    (uint32_t*)sine_table, 64, 
-//                    DAC_ALIGN_12B_R);
-//验证运放Gain=2时，100KSINE波形是否失真
-//HAL_OPAMP_Start(&hopamp1);
-
-
-
   /* USER CODE END 2 */
 
   /* Infinite loop */
