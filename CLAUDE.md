@@ -280,6 +280,21 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 ### 软启动直接写寄存器
 - `LLC_SoftStart_Step()` 绕过 HAL 直接写 `MPER/PERxR/CMPxR`，并通过预装载（`PreloadEnable`）在 MREP 时刻安全生效。修改频率参数时务必同步更新 CMP1（移相）与 CMP4（关断点），否则波形错乱。
 
+### re-arm 重入 SOFTSTART 前几拍漏旧 period（2026-06-13，已修）
+- 现象：CH1=DIS、CH2=PWM。DIS 放行后 PWM 前 1~3 拍约 140k，到第 5~6 拍才变 300k；冷启动正常，仅 re-arm（FAULT→WAIT_AUX→SOFTSTART，**MCU 未掉电、HRTIM 未复位**）这条路径有。
+- 真因：关断前 RUN 定频(~140k)，有效 MPER 残留旧值；`LLC_SoftStart_Init` 用 `__HAL_HRTIM_SETPERIOD` 写的是**预装载**寄存器，旧 active MPER 要等下一个更新事件(MREP，`RepetitionCounter=3` → 每 4 拍)才被 18133 替换；而输出在 latch 之前就被 `WaveformOutputStart` 使能 → 前几拍用旧 140k。叠加 `SafeSM_EnterFault()` 只停输出、**没停计数器**（FAULT 期间 Master/TimerA 还在以旧周期空跑），残留更确定。
+- 修复（仅改 `LLC_SoftStart_Init` 入口时序，不动扫频算法/方向）：① 复位扫频变量到 300k；② 停计数器(`WaveformCountStop`)拿确定起点；③ 写预装载 18133；④ `HAL_HRTIM_SoftwareUpdate`(强制预装载→有效寄存器立即生效) + `HAL_HRTIM_SoftwareReset`(清零 CNT)，并轮询 `CR2` 的 `MSWU/TASWU/TCSWU` 自清确认 latch 完成；⑤ **确认生效后**才 `WaveformOutputStart` + `WaveformCountStart(MASTER|TIMER_A)`。
+- 关键点：杜绝"先使能输出、period 随后才更新"；该"预加载→强制 latch→清零计数→再使能"的顺序对冷启动与 re-arm 两条路径都适用。验证：re-arm 后 CH2 第一个完整周期即 ≈300k（最密），随后逐拍变疏单调降到 140k。
+- 注：`LLC_SoftStart_Step` 的 `static skip_cnt` 未在 Init 里归零——只影响"首次降频步进时机"（早/晚几拍），不影响起始 300k 值，有意不动以守住"只改一处"。
+
+### re-arm 起振首拍高电平偏宽（频率已对，2026-06-13 续修）
+- 现象：上一条修复后频率已是 300k（实测 304.9k），但**偶发第一拍高电平偏宽**，次拍起规整。
+- 真因（两点叠加，均在热重启路径）：
+  ① **TimerA `InterleavedMode=DUAL` → 硬件自动 CMP1=PER/2**（导通时间=半周期；全工程从不手写 TimerA CMP1）。该 CMP1 在"PER 更新事件"时刻重算；若首个 `MASTERPER` 置位发生在 CMP1 还停留在旧 PER/2(≈19550) 的窗口，而新周期仅 18133<19550 → TA1 第一周期内**等不到复位点** → 首拍高电平拖到次拍（≈3 倍宽）。
+  ② `WaveformOutputStop` 后 TA1 的 **SR 锁存残留态**，重使能时若残留为高也会让首拍偏宽。"偶发"=相位+残留竞态。
+- 修复（仍只动 `LLC_SoftStart_Init` 入口，不碰扫频/占空算法）：① 把 `SoftwareReset(CNT=0)` 调到 `SoftwareUpdate` **之前**——在 CNT=0 干净点做更新，使 period 与 interleaved 自动 CMP1=PER/2 在**同一更新事件**里一起 latch；② 使能输出前用 `HAL_HRTIM_WaveformSetOutputLevel(TA1/TC1 → INACTIVE)` 把主通道 SR 锁存强制清失活（互补 TA2/TC2 由死区单元派生，无需也无法单独强制）。
+- 验证：热重启起振后第一拍的频率与高电平宽度即与第二拍一致（300k、占空正常），多次复现不再偏宽。
+
 ### 故障防误触发
 - DAC 阈值建立需要时间，**必须**先屏蔽 Fault、`HAL_Delay(1)` 后再清标志使能，否则上电瞬间会误锁死。
 

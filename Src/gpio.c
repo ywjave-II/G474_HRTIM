@@ -51,9 +51,9 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, LED1_Pin|LED2_Pin|LED3_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOC, LED1_Pin|LED2_Pin|LED3_Pin, GPIO_PIN_SET);
 
-  /* DIS(PA12) 默认电平：SET=高=DIS 高=失能（PA12 IO 直驱，已拆 2N7002；安全默认）。*/
+  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(DIS_GPIO_Port, DIS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pins : LED1_Pin LED2_Pin LED3_Pin */
@@ -63,10 +63,10 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
 
-  /*Configure GPIO pin : DIS_Pin (推挽输出；PA12 直驱 DIS：SET=高=失能，RESET=低=使能；已拆 2N7002)*/
+  /*Configure GPIO pin : DIS_Pin */
   GPIO_InitStruct.Pin = DIS_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
-  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(DIS_GPIO_Port, &GPIO_InitStruct);
 

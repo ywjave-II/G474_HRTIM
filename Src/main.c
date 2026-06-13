@@ -22,6 +22,7 @@
 #include "comp.h"
 #include "dac.h"
 #include "hrtim.h"
+#include "iwdg.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -126,7 +127,12 @@ int main(void)
   MX_ADC2_Init();
   MX_USART1_UART_Init();
   MX_TIM3_Init();
+  MX_IWDG_Init();
   /* USER CODE BEGIN 2 */
+
+  /* 调试时冻结 IWDG：核心 halt(断点/单步)时停狗，避免调试中被看门狗复位。
+   * 不影响正常运行（仅在调试器暂停内核时生效）。*/
+  __HAL_DBGMCU_FREEZE_IWDG();
 
   /* ---- INIT：复位后第一件事，强制封波 + DIS 失能，杜绝重启窗口出现 PWM ---- */
   SafeSM_Init();                 /* HRTIM 输出 inactive + DIS=SET(失能) + 状态归 WAIT_AUX */
@@ -195,6 +201,7 @@ Fault_IRQ_Enable();
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    HAL_IWDG_Refresh(&hiwdg);  /* 喂狗：只要主循环还在转就喂；卡死(busy-wait/ISR风暴/UART楔死)→停喂→~2s 后复位回 INIT 安全态 */
     SafeSM_Poll();          /* 安全状态机：WAIT_AUX/SOFTSTART/RUN/FAULT 转移 + PVD 轮询 */
     Fault_Report_Poll();    /* 串口诊断：故障详情 + [STAT] 心跳 + [REGS] 一次性寄存器 dump */
   }
@@ -217,8 +224,9 @@ void SystemClock_Config(void)
   /** Initializes the RCC Oscillators according to the specified parameters
   * in the RCC_OscInitTypeDef structure.
   */
-  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSE;
+  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_LSI|RCC_OSCILLATORTYPE_HSE;
   RCC_OscInitStruct.HSEState = RCC_HSE_ON;
+  RCC_OscInitStruct.LSIState = RCC_LSI_ON;
   RCC_OscInitStruct.PLL.PLLState = RCC_PLL_ON;
   RCC_OscInitStruct.PLL.PLLSource = RCC_PLLSOURCE_HSE;
   RCC_OscInitStruct.PLL.PLLM = RCC_PLLM_DIV3;

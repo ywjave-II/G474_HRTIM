@@ -26,6 +26,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/comp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/dac.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/hrtim.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/iwdg.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/tim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/usart.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/stm32g4xx_it.c
@@ -58,6 +59,7 @@ set(STM32_Drivers_Src
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_dac_ex.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_hrtim.c
+    C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_iwdg.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_tim_ex.c
     C:/Users/ywjAv/STM32Cube/Repository/STM32Cube_FW_G4_V1.6.3/Drivers/STM32G4xx_HAL_Driver/Src/stm32g4xx_hal_uart.c
