@@ -45,21 +45,21 @@ void LLC_SoftStart_Init(void)
         }
     }
 
-    /* (3b) 使能输出前，把主通道 TA1/TC1 强制到失活电平，清掉上次 RUN 残留的 SR 锁存态，
-     *      保证起振首个上升沿是干净的 MASTERPER 置位（互补的 TA2/TC2 由死区单元从主通道派生，
-     *      死区开启时无法、也无需单独强制）。消除"偶发首拍偏宽"的残留竞态。*/
+    /* (3b) 使能输出前，把主通道 TA1 强制到失活电平，清掉上次 RUN 残留的 SR 锁存态，
+     *      保证起振首个上升沿是干净的 MASTERPER 置位（互补的 TA2 由死区单元从主通道派生，
+     *      死区开启时无法、也无需单独强制）。消除"偶发首拍偏宽"的残留竞态。
+     *      注：TimerC（副边同步整流）本版开环测试不驱动，输出不使能（见下），故不在此强制。*/
     HAL_HRTIM_WaveformSetOutputLevel(&hhrtim1, HRTIM_TIMERINDEX_TIMER_A,
         HRTIM_OUTPUT_TA1, HRTIM_OUTPUTLEVEL_INACTIVE);
-    HAL_HRTIM_WaveformSetOutputLevel(&hhrtim1, HRTIM_TIMERINDEX_TIMER_C,
-        HRTIM_OUTPUT_TC1, HRTIM_OUTPUTLEVEL_INACTIVE);
 
     __HAL_HRTIM_MASTER_ENABLE_IT(&hhrtim1, HRTIM_MASTER_IT_MREP);
 
     /* (4) 起始 period+CMP 已生效、输出已清到失活后，才解除封波 / 使能输出 + 启动计数。
-     *     软启动开机时刻不开 TIMER C 同步整流驱动。*/
+     *     ⚠️ 只使能原边 TA1/TA2。TimerC（副边同步整流 TC1/TC2）本版不计数，若在此使能输出，
+     *     死区单元会把停在失活态的 TC1 取反 → TC2(PB13) 被钉死在高电平（假驱动）。要做同步整流
+     *     时应改为同时 CountStart(TIMER_C) 并在此放开 TC1/TC2，而非只使能输出。*/
     HAL_HRTIM_WaveformOutputStart(&hhrtim1,
-        HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
-        HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+        HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2);
 
     HAL_HRTIM_WaveformCountStart(&hhrtim1,
         HRTIM_TIMERID_MASTER |

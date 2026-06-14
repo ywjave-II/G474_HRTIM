@@ -32,7 +32,7 @@ extern "C" {
 /* ---- 标定校正（沿用原 VOUT 标定方法，默认不校正）----
  * VAUX(mV) = 理论值 × VAUX_CAL_GAIN + VAUX_CAL_OFFSET_MV */
 #define VAUX_CAL_GAIN        1.0f
-#define VAUX_CAL_OFFSET_MV   0.0f
+#define VAUX_CAL_OFFSET_MV   100.0f
 
 /* 真实电压(mV) -> 引脚(mV) -> ADC/DAC 码（12bit, 3.3V 基准）。
  * 给 safe_sm.h 的门限常量复用，保证「门限的伏特值」与「ADC/DAC 码」同源换算。*/
