@@ -35,7 +35,7 @@
 #include <stdio.h>
 #include "freq_skip.h"
 #include "fault_log.h"
-#include "vaux_adc.h"
+#include "adc_app.h"     /* 统一 ADC 采样（VAUX/VOUT/I_CYCLE/IOU）*/
 #include "safe_sm.h"
 /* USER CODE END Includes */
 
@@ -138,8 +138,9 @@ int main(void)
   SafeSM_Init();                 /* HRTIM 输出 inactive + DIS=SET(失能) + 状态归 WAIT_AUX */
   SafeSM_ConfigBrownout();       /* MCU 自身 PVD 欠压预警（BOR 见 safe_sm.c 顶部，为 option byte）*/
 
-  /* 启动辅助电源(VAUX：原 VOUT/PA1 已飞线改接 24V 轨)采样：ADC1 自校准 + TIM3 10kHz */
-  VAUX_ADC_Init();
+  /* 启动统一 ADC 采样（App/adc_app.c）：ADC1/ADC2 自校准 + TIM3 10kHz 周期中断。
+   * 默认启用 VAUX(ADC1/PA1)，VOUT/I_CYCLE/IOU 通过 adc_app.h 开关按需启用。*/
+  ADC_APP_Init();               /* 统一 ADC 采样启动：自校准 + TIM3 10kHz（VAUX 默认开启）*/
 
   /* 关闭 stdout 缓冲：裸机 newlib 默认全缓冲，\n 不 flush，会导致"串口没输出"。*/
   setvbuf(stdout, NULL, _IONBF, 0);

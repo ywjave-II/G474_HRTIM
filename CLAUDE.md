@@ -15,12 +15,15 @@
 > 才重启）；软件 22V 优雅封波 + COMP2/FLT1 硬件 21V 低有效锁存兜底；新增 **PVD(代码)** 与
 > **BOR(代码自动配置 option byte，无需外部工具)** MCU 自保护。详见 §5c。
 >
-> **2026-06-13 校订（v6）—— CubeMX 待办全部落地 + 参数对齐源码**：§5c 原列的 CubeMX 待办已在
-> 重新生成的源码里完成：**HRTIM Fault1=`LOW` + `Filter=FAULTFILTER_9`**（`hrtim.c:50-51`）、
-> **COMP2 迟滞=`40MV`**（`comp.c:46`）、**DIS 上电默认 SET+NOPULL**（`gpio.c:57/69`）。另对齐若干源码
-> 参数：**时钟改 HSE 12 MHz/PLLM=DIV3**（仍 170 MHz）、**软启动目标 39100=139.5 kHz**（非 41846/130k）、
-> **COMP4/6 DAC 阈值=3500**、COMP2 阈值=`VAUX_HW_TRIP_DAC`(2606,21V)、串口 [BOOT] 已是 USART1。
-> ⚠️ 仅剩可选项：COMP4/6 迟滞仍 20MV（OCP/OVP 抗扰加固）。
+> **2026-06-14 进展（v6.1）—— 统一 ADC 采样模块**：原分散的 `vaux_adc.c/h` + `vout_adc.c/h` 整合为
+> 单一 `App/adc_app.c/h`，所有 ADC 采样通道通过头文件 `#if` 开关集中管理。通道切换只需改
+> `adc_app.h` 的 `CHANNEL`/`HANDLE` 宏，无需重生成 CubeMX。旧文件 `#if 0` 保留备用。
+> ADC2 已确认 ScanConvMode=DISABLE + NbrOfConversion=1（软件重配通道，不依赖硬件扫描）。
+> VOUT(ADC2/IN12/PB2) 已具备即改即用条件，待硬件接线。
+>
+> **2026-06-17 进展（v6.2）—— VOUT 通道正式启用**：硬件改接 VOUT 分压点至 **ADC2/IN12/PB2**；
+> `adc_app.h` 开关 `ADC_APP_ENABLE_VOUT=1`；VOUT 采样数据加入 `[STAT]` 串口心跳打印；
+> 旧文件 `vout_adc.c` / `vaux_adc.c` 的 `#include` 统一收进 `#if 0`，杜绝宏/声明冲突。
 
 ## 目标硬件
 
@@ -44,23 +47,22 @@ main()
  ├─ MX_GPIO_Init()                        LED1/2/3 = PC1/PC2/PC3（开漏，低电平点亮）
  ├─ MX_HRTIM1_Init()                      PWM + 死区 + 3 路 Fault
  ├─ MX_DAC1/2/4_Init()                    比较器阈值源
- ├─ MX_ADC1/2_Init()                      ADC1=VAUX(PA1/IN2,规则组,原VOUT飞线)；ADC2=IOU/I_CYCLE
+ ├─ MX_ADC1/2_Init()                      ADC1=VAUX(PA1/IN2,规则组,原VOUT飞线)；ADC2=VOUT/IOU/I_CYCLE
  ├─ MX_COMP2/4/6_Init()                   保护检测
  ├─ MX_USART1_UART_Init()                 调试串口（PB6/PB7）
  ├─ MX_TIM3_Init()                        10kHz 周期中断（驱动 VAUX 采样）
  ├─ [安全启动序列] 屏蔽 Fault → 启 COMP/DAC → 延时 → 清标志 → 使能 Fault
- ├─ HAL_HRTIM_WaveformOutputStart/CountStart()
  ├─ LLC_SoftStart_Init()  ──┐
  ├─ Fault_IRQ_Enable()      │            使能 FLT 中断(IER)；NVIC 由 CubeMX MspInit 开
- └─ VAUX_ADC_Init()         │            ADC1 自校准 + 启动 TIM3 周期中断
+ └─ ADC_APP_Init()          │            统一 ADC 启动：自校准 + TIM3 10kHz 周期中断
                             ↓
         ⚠️ 注：上电不再无条件启 PWM/软启动；这些已移入 safe_sm 的 WAIT_AUX→SOFTSTART（见 §5c）
 
 HRTIM1_Master_IRQHandler ─→ LLC_SoftStart_Step()   // 每次 MREP 中断扫频
    (stm32g4xx_it.c)            (App/freq_skip.c)
 
-TIM3_IRQHandler ──────────→ HAL_TIM_PeriodElapsedCallback()   // 10kHz 软件触发 ADC1 读 VAUX → 喂 safe_sm
-   (stm32g4xx_it.c)            (App/vaux_adc.c)
+TIM3_IRQHandler ──────────→ HAL_TIM_PeriodElapsedCallback()   // 10kHz 统一采样(VAUX+VOUT+…) → 喂 safe_sm
+   (stm32g4xx_it.c)            (App/adc_app.c)
 
 COMP2/4/6 ──(内部 Fault 线)──→ HRTIM Fault1/2/3 ──→ 硬件强制 PWM 输出 INACTIVE
                                       └─→ HRTIM1_FLT_IRQHandler → Fault_OnIRQ()  // 软件记录+点灯
@@ -198,18 +200,38 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 - ⚠️ **必须在第一次 printf 前 `setvbuf(stdout, NULL, _IONBF, 0)`**：裸机 newlib 默认全缓冲，`\n` 不 flush，否则表现为"串口不打印"（见踩坑记录）。
 - 注：`[BOOT]` 打印字符串已修正为 "USART1"（旧版曾误写 USART3）。
 
-### 5b. ~~VOUT ADC 采样~~（`App/vout_adc.c` —— **已停用，被 §5b' VAUX 取代**）
+### 5b. 统一 ADC 采样模块（`App/adc_app.c/h` — 2026-06-14 整合）
 
-> ⚠️ v5 起 PA1 已飞线改接辅源 24V 轨，本节内容由 **§5c / `App/vaux_adc.c`** 接管；`vout_adc.c`
-> 两个函数已 `#if 0` 关闭（避免与 vaux_adc.c 的 `HAL_TIM_PeriodElapsedCallback` 重复定义）。
-> 下文保留原 VOUT 描述仅供历史参考。
+> **v6.1**：原分散的 `vaux_adc.c/h` + `vout_adc.c/h` 整合为单一 `adc_app.c/h`。
+> 所有 ADC 采样通道（VAUX/VOUT/I_CYCLE/IOU）通过头文件 `#if` 开关集中管理，
+> `HAL_TIM_PeriodElapsedCallback`（全工程唯一实现）在 `adc_app.c` 中。
 
-- **通道**：ADC1 规则组 Rank1 = IN2 = **PA1**（原 VOUT，现 VAUX），采样时间 247.5 cycles，12bit。
-- **触发**：方案 A —— **TIM3 10kHz 周期中断软件触发**（`HAL_TIM_PeriodElapsedCallback` → `HAL_ADC_Start` + 自旋等 EOC + `HAL_ADC_GetValue`）。ADC 触发源保持 `ADC_SOFTWARE_START`，未用 TRGO 硬件触发。
-  - 自旋等 EOC（不依赖 `HAL_GetTick`），中断里安全、ADC 异常也不死锁。
-- **启动**：`VOUT_ADC_Init()`（main USER CODE 2 末尾）做 ADC1 单端自校准 + `HAL_TIM_Base_Start_IT(&htim3)`。
-- **换算**：`g_vout_raw`(0..4095) → 引脚 mV(`raw×3300/4095`) → ×分压比(`VOUT_DIV_NUM/DEN`，默认 10/1) → ×标定 `VOUT_CAL_GAIN` + `VOUT_CAL_OFFSET_MV` → `g_vout_mv`。标定方法见头文件注释（两点法/单点增益法）。
-- 结果随 `[STAT]` 串口心跳打印。**慢电压量用规则组足矣**；需与开关周期同步的电流采样才用注入组。
+**设计原则：**
+- **通道切换纯改头文件**：每个通道采样前一律 `HAL_ADC_ConfigChannel` 重配寄存器，
+  换通道只需改 `adc_app.h` 的 `CHANNEL`/`HANDLE` 宏，无需重生成 CubeMX。
+- **条件编译开关**：`ADC_APP_ENABLE_VAUX=1`（默认开启），`ADC_APP_ENABLE_VOUT=1`（已启用），`I_CYCLE/IOU` 默认 0，
+  按需改为 1 即生效。
+- **同一 ADC 多通道顺序采样**：每个通道独立 `ConfigChannel → Start → 自旋 EOC → Read → Stop`，
+  块之间无耦合，增删互不影响。10kHz(100µs) 周期下 3 通道约 24µs，完全可接受。
+
+**当前通道：**
+
+| 通道 | 开关 | ADC/引脚 | 状态 | 用途 |
+|------|------|----------|------|------|
+| VAUX | `ADC_APP_ENABLE_VAUX=1` | ADC1/IN2/PA1 | ✅ 活跃 | 辅源 24V 采样 → 喂 SafeSM（22V 软封波 + 23V 重入）|
+| VOUT | `ADC_APP_ENABLE_VOUT=1` | ADC2/IN12/PB2 | ✅ 活跃 | LLC 输出电压反馈 |
+| I_CYCLE | `ADC_APP_ENABLE_ICYCLE=0` | ADC2/IN12/PB2 | 🔒 待启用 与 VOUT 互斥| 谐振腔电流 |
+| IOU | `ADC_APP_ENABLE_IOU=0` | ADC2/IN5/PC4 | 🔒  | 输出电流 |
+
+**旧文件状态：**
+- `vaux_adc.c`：已 `#if 0` 禁用（全局变量 + 函数均停用），`vaux_adc.h` 保留供参数参考
+- `vout_adc.c`：已 `#if 0` 禁用（2026-06-12），`vout_adc.h` 保留
+
+**信号链（与旧版一致）：**
+- **触发**：TIM3 10kHz 周期中断软件触发
+- **滤波**：一阶 EWMA（α=1/8, τ≈0.8ms@10kHz），首样预置避免上电爬升误判
+- **换算**：raw(0..4095) → 引脚 mV(`raw×3300/4095`) → ×分压比 → ×标定 GAIN/OFFSET → mV（浮点仅串口显示用）
+- **安全链路**：VAUX 的 EWMA 滤波码直接整数比较 22V/23V 门限，浮点不参与控制
 
 ### 6. ARM CMSIS-DSP 数学库
 
@@ -235,7 +257,7 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 |---|---|---|
 | `HRTIM1_Master_IRQHandler` | HRTIM Master 重复事件 MREP（每 4 个 PWM 周期）| 清 MREP 标志 → `LLC_SoftStart_Step()` 扫频 |
 | `HRTIM1_FLT_IRQHandler` | HRTIM Fault1/2/3（COMP2/4/6 越限）| `Fault_OnIRQ()`：记录通道/次数/时刻、点亮对应 LED、关本路中断防风暴 |
-| `TIM3_IRQHandler` | TIM3 更新事件（10 kHz）| `HAL_TIM_PeriodElapsedCallback()` → 软件触发 ADC1 采 VAUX + EWMA + 喂 safe_sm（`App/vaux_adc.c`）|
+| `TIM3_IRQHandler` | TIM3 更新事件（10 kHz）| `HAL_TIM_PeriodElapsedCallback()` → 统一 ADC 采样（VAUX+VOUT+…）+ EWMA + 喂 safe_sm（`App/adc_app.c`）|
 | `SysTick_Handler` | 1 ms 节拍 | `HAL_IncTick()`（供 `HAL_Delay`）|
 | `NMI / HardFault / MemManage / BusFault / UsageFault` | CPU 异常 | 死循环挂起 |
 
@@ -328,7 +350,7 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 
 ---
 
-### 5c. 辅助电源(VAUX)安全监测 + 安全重入状态机（`App/safe_sm.c` / `vaux_adc.c`）
+### 5c. 辅助电源(VAUX)安全监测 + 安全重入状态机（`App/safe_sm.c` / `adc_app.c`）
 
 **动机（事故）**：连续多次重启时独立辅助电源缓慢衰减，MCU 在欠压/不确定态仍输出 PWM，再次
 上电瞬间疑似半桥误开通 → MOS 全部击穿。本子系统消除这个"重启窗口"。
@@ -336,7 +358,7 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 **硬件前提（已飞线，软件按此适配，不新增通道/不改分压）**：
 - 原采样 VOUT 的 **ADC1_IN2 = PA1** 已飞线改接辅助电源 **24V 轨**（经原分压，比例 10:1 不变）。
 - 同一分压点并接 **COMP2 的 IN+ = PA3**，IN− = DAC1_CH2，做 21V 硬件欠压闸。
-- 分压比 / 伏特↔ADC码↔DAC码 全部沿用原 VOUT 换算（`vaux_adc.h`），不重算。
+- 分压比 / 伏特↔ADC码↔DAC码 全部沿用原 VOUT 换算（现统一在 `adc_app.h` 中，`VAUX_MV_TO_CODE` 宏），不重算。
 
 **门限（集中在 `safe_sm.h`，伏特→码用 `VAUX_MV_TO_CODE` 同源换算）**：
 
@@ -352,7 +374,7 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 > 是存不住的死逻辑。现重启条件仅为 **VAUX 回升≥REARM(23V) 且 WAIT_AUX 稳定 50ms 自检通过**。
 
 **分层防护（由软到硬，互为兜底）**：
-1. **软件优雅封波**：10kHz ISR(`vaux_adc.c`) 读 VAUX → 一阶 EWMA(α=1/8,τ≈0.8ms) → `SafeSM_OnSample()`；
+1. **软件优雅封波**：10kHz ISR(`adc_app.c`) 读 VAUX → 一阶 EWMA(α=1/8,τ≈0.8ms) → `SafeSM_OnSample()`；
    仅在 SOFTSTART/RUN 跌破 22V 时 `SafeSM_EnterFault()`。临界路径全整数。
 2. **硬件兜底封波**：COMP2(PA3) vs DAC1_CH2(21V) → **HRTIM Fault1「低有效 + latched」**（VAUX<21V 时
    COMP 输出低=故障，纳秒级硬封 PWM，不依赖 ISR 节拍）。方向矛盾用"低有效"解决，不动硬件接法。
@@ -407,8 +429,8 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 | 项 | 文件 | 状态 |
 |---|---|---|
 | 闭环控制 | `App/driver.c` | `DRIVER_Run(ref,fb)` 仅返回 `ref-fb`，**从未被调用**（孤立桩）；本版开环测增益，无闭环 |
-| ADC 反馈采样 | `App/vaux_adc.c` | ✅ ADC1/PA1 已改采 **VAUX(辅源24V)**（TIM3 10kHz + EWMA），有 `g_vaux_mv`；IOU/I_CYCLE(ADC2) 仍未启动；原 VOUT 采样已停用(`vout_adc.c` `#if 0` 保留) |
-| VAUX 标定 | `vaux_adc.h` | 分压比沿用 10/1，`VAUX_CAL_GAIN/OFFSET` 默认未校正——按实测两点法/单点法填 |
+| ADC 反馈采样 | `App/adc_app.c/h` | ✅ 统一模块：VAUX(ADC1/PA1) 活跃，VOUT/I_CYCLE/IOU(ADC2) 条件编译待启用；旧 `vaux_adc.c` / `vout_adc.c` 均已 `#if 0` 停用保留 |
+| VAUX 标定 | `adc_app.h` | 分压比沿用 10/1，`ADC_VAUX_CAL_GAIN/OFFSET` 默认未校正——按实测两点法/单点法填 |
 | HRTIM Fault1 极性 | `hrtim.c:50` | ✅ 已改 **`LOW`(低有效)** + Filter_9，VAUX 欠压硬件闸已生效（v6）|
 | 故障恢复 | `App/fault_log.c` | 已有 `Fault_Rearm()` 可手动恢复；**无自动恢复**（对 OCP/OVP 是有意为之）；尚无触发入口（如串口指令） |
 | 故障上报 | `App/fault_log.c` | ✅ 已实现 `Fault_Report_Poll()` 串口打印（故障详情 + [STAT] + [REGS]）|
@@ -427,9 +449,10 @@ G474_HRTIM/
 │   ├── io_retarget.c/h    printf → USART1 重定向（huart1）
 │   ├── freq_skip.c/h      LLC 变频软启动（核心控制）
 │   ├── fault_log.c/h      HRTIM 故障中断记录 + 恢复 + 串口上报（g_fault / Fault_Rearm / Fault_Report_Poll）
-│   ├── vaux_adc.c/h       VAUX(辅源24V) ADC 采样（TIM3 10kHz 触发 + EWMA + 分压还原 + 标定）→ 喂 safe_sm
+│   ├── adc_app.c/h        【v6.1】统一 ADC 采样（VAUX/VOUT/I_CYCLE/IOU 条件编译，#if 开关集中管理）
 │   ├── safe_sm.c/h        辅源安全监测 + 安全重入状态机（门限/状态机/enter_fault/PVD/BOR）见 §5c
-│   ├── vout_adc.c/h       【已停用·保留】原 VOUT 采样，被 vaux_adc 取代（函数 #if 0）
+│   ├── vaux_adc.c/h       【已停用·保留】原 VAUX 采样，已迁移至 adc_app.c（#if 0）
+│   ├── vout_adc.c/h       【已停用·保留】原 VOUT 采样，已迁移至 adc_app.c（#if 0）
 │   └── driver.c/h         控制驱动桩（未使用）
 ├── cmake/
 │   ├── gcc-arm-none-eabi.cmake   工具链 + 链接器标志
@@ -448,27 +471,29 @@ G474_HRTIM/
 - **v1（已被取代）**：固定 200 kHz 互补 PWM，50% 占空比，副边 180° 移相，死区 250 ns，UART 走 USART1(PC4/PC5)，用 `App/test.c` 做 PID 桩。CLAUDE.md 早期版本描述此状态。
 - **v2**：变频软启动（300→130 kHz PFM），新增 COMP2/4/6 + DAC1/2/4 硬件保护，UART 改为 USART3(PB9/PB8)，删除 test.c，新增 freq_skip.c。
 - **v3**：新增 `fault_log` 故障中断记录（`HRTIM1_FLT_IRQHandler` → `Fault_OnIRQ`，三路 LED 指示 + `Fault_Rearm` 恢复）；引脚重排（LED1/2/3=PC1/2/3，ADC 增配 VOUT/IOU/I_CYCLE + ADC2）。
-- **v4（当前，2026-06-06）**：串口诊断上报 `Fault_Report_Poll`（故障详情 + `[STAT]` + `[REGS]`）；新增 `vout_adc`（ADC1 规则组 VOUT + TIM3 10kHz 触发 + 标定校正）；串口 USART3→**USART1(PB6/PB7)**；当日完成多项硬件调试（PB12/13 短路、PB11 噪声误触发、串口共地、printf 全缓冲）。
+- **v4（2026-06-06）**：串口诊断上报 `Fault_Report_Poll`（故障详情 + `[STAT]` + `[REGS]`）；新增 `vout_adc`（ADC1 规则组 VOUT + TIM3 10kHz 触发 + 标定校正）；串口 USART3→**USART1(PB6/PB7)**；当日完成多项硬件调试（PB12/13 短路、PB11 噪声误触发、串口共地、printf 全缓冲）。
+- **v5/v6（2026-06-12/13）**：辅源安全监测 + 安全重入状态机（`safe_sm.c`）；VAUX 采样(原 VOUT/PA1 飞线改接 24V 轨)；21V/22V/23V 三层防护；PVD + BOR 代码自配置；IWDG 看门狗；软启动 re-arm 修复；CubeMX 待办全部落地。
+- **v6.1（2026-06-14）**：统一 ADC 采样模块 `App/adc_app.c/h` 整合 VAUX/VOUT/I_CYCLE/IOU；条件编译 `#if` 开关 + 软件 `ConfigChannel` 重配，通道切换纯改头文件；vaux_adc/vout_adc 旧文件 `#if 0` 保留。
+- **v6.2（2026-06-17，当前）**：VOUT 硬件改接 ADC2/IN12/PB2 并正式启用；VOUT 采样数据加入 `[STAT]` 串口心跳；旧文件 `#include` 收进 `#if 0` 杜绝冲突；确认 10kHz ISR 余量充足（~21µs/100µs），PI 闭环可在此基础上直接加入。
 
 ---
 
 ## 当前状态与下一步
 
 > **已完成**：
-> - PA8/PA9、PB12/PB13 互补 PWM，180° 移相，死区 250 ns ✓（实测，PB12/13 短路已排除）
-> - 300→139.5 kHz 变频软启动（中断驱动）✓
-> - 三路比较器硬件 OCP/OVP 保护（锁死型）✓
+> - PA8/PA9、PB12/PB13 互补 PWM，180° 移相，死区 250 ns ✓
+> - 300→139.5 kHz 变频软启动（中断驱动，含 re-arm 修复）✓
+> - 三路比较器硬件 OCP/OVP/VAUX_UVP 保护（锁死型 + Filter_9 + 迟滞）✓
 > - 故障软件记录 + **串口上报** `Fault_Report_Poll`（故障详情 + `[STAT]` + `[REGS]`）✓
-> - **VOUT ADC 采样**（ADC1/PA1，TIM3 10kHz 触发，分压还原 + 标定）✓（FLASH ~10.4%/RAM 2.5%）
-> - UART(USART1) 调试 + DSP 库集成 ✓
->
-> - **辅源安全监测 + 安全重入**（v5/v6）：VAUX 采样(原 VOUT 飞线) + 软件 22V 优雅封波 + COMP2/FLT1 硬件
->   21V 低有效兜底 + 状态机(INIT→WAIT_AUX→SOFTSTART→RUN→FAULT) + VAUX≥23V 重启 + PVD/BOR ✓
->   **CubeMX 待办已全部落地**（Fault1=LOW+Filter_9、COMP2=40MV、DIS 默认 SET）✓（v6）
+> - **辅源安全监测 + 安全重入状态机**（VAUX 22V 软封波 + COMP2/Fault1 21V 硬兜底 + 23V 重入 + PVD/BOR/IWDG）✓
+> - **统一 ADC 采样模块** `adc_app.c/h`（VAUX 活跃；VOUT/I_CYCLE/IOU 条件编译就绪；切换通道纯改头文件）✓（v6.1）
+> - **VOUT 通道正式启用**（ADC2/IN12/PB2，`ADC_APP_ENABLE_VOUT=1`，`[STAT]` 串口打印）✓（v6.2）
+> - CubeMX 所有待办已落地 ✓
 >
 > **下一步**：
-> 1. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `VAUX_CAL_GAIN/OFFSET`；
+> 1. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `ADC_VAUX_CAL_GAIN/OFFSET`；
 >    实测确认 22V 软封波、21V 硬封波、23V 重启各门限动作正确。
-> 2. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——消除原 OCP/OVP 噪声误触发。
-> 3. **闭环**：反馈 → 主循环/定时中断跑 PID/`DRIVER_Run` → 动态调 HRTIM 周期（PFM 调压）；启动 IOU/I_CYCLE(ADC2)。
-> 4. 可选：给 `Fault_Rearm()`/重启流程 加串口指令触发入口。
+> 2. **VOUT 标定**：填入实际分压比到 `ADC_VOUT_DIV_NUM/DEN`，按需填 `ADC_VOUT_CAL_GAIN/OFFSET`。
+> 3. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——消除原 OCP/OVP 噪声误触发。
+> 4. **闭环**：反馈 → 主循环/定时中断跑 PID/`DRIVER_Run` → 动态调 HRTIM 周期（PFM 调压）；
+>    启用 I_CYCLE/IOU(ADC2) 作为电流反馈。

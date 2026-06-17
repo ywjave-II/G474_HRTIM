@@ -1,6 +1,7 @@
 #include "fault_log.h"
 #include "freq_skip.h"     /* llc_period / softstart_done，用于打印实际开关频率 */
-#include "vaux_adc.h"      /* g_vaux_raw / g_vaux_mv，用于打印辅助电源采样 */
+#include "adc_app.h"       /* g_vaux_raw / g_vaux_filt / g_vaux_mv，用于打印 VAUX 采样；
+                             * 若启用 VOUT/I_CYCLE/IOU，对应全局变量也在此提供 */
 #include "safe_sm.h"       /* g_safe_state，打印安全状态机当前状态 */
 #include <stdio.h>         /* printf -> USART1（io_retarget.c 重定向）*/
 
@@ -119,6 +120,17 @@ void Fault_Report_Poll(void)
             "INIT", "WAIT_AUX", "SOFTSTART", "RUN", "FAULT"
         };
         safe_state_t st = g_safe_state;
+#if ADC_APP_ENABLE_VOUT
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu | VAUX raw=%u filt=%u (%u mV) | VOUT raw=%u filt=%u (%u mV)\r\n",
+               (st <= SAFE_FAULT) ? st_name[st] : "?",
+               (unsigned long)per,
+               (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
+               softstart_done,
+               g_fault.tripped,
+               (unsigned long)g_fault.total_cnt,
+               g_vaux_raw, g_vaux_filt, g_vaux_mv,
+               g_vout_raw, g_vout_filt, g_vout_mv);
+#else
         printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu | VAUX raw=%u filt=%u (%u mV)\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
@@ -126,9 +138,8 @@ void Fault_Report_Poll(void)
                softstart_done,
                g_fault.tripped,
                (unsigned long)g_fault.total_cnt,
-               g_vaux_raw,
-               g_vaux_filt,
-               g_vaux_mv);
+               g_vaux_raw, g_vaux_filt, g_vaux_mv);
+#endif
     }
 
     /* ---- 3) 软启动完成后打印一次 Timer A / Timer C 关键寄存器，定位 260k 问题 ----

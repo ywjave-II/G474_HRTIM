@@ -1,6 +1,24 @@
-#include "vaux_adc.h"
-#include "safe_sm.h"     /* SafeSM_OnSample()：把滤波后的采样喂给安全状态机 */
+/* ============================================================================
+ * 【已停用 / 保留备用】2026-06-14：VAUX 采样逻辑已迁移至 App/adc_app.c。
+ *
+ * adc_app.c 统一管理所有 ADC 采样通道（VAUX/VOUT/I_CYCLE/IOU），
+ * 通过头文件开关（ADC_APP_ENABLE_VAUX=1）启用。本文件全部内容用 #if 0 关闭。
+ *
+ * 关闭原因：
+ *   1) HAL_TIM_PeriodElapsedCallback 是 HAL 的 __weak 单例回调，全工程只能有一处实现；
+ *      adc_app.c 已重新实现它（包含 VAUX + VOUT + I_CYCLE + IOU 采样），
+ *      此文件若一起编译会重复定义导致链接报错。
+ *   2) VAUX_ADC_Init 已被 ADC_APP_Init 取代（同样校准 ADC1 + 启动 TIM3 10kHz）。
+ *   3) 全局变量 g_vaux_raw/filt/mv 已移至 adc_app.c 定义，此处若再定义会重复符号。
+ *
+ * 恢复方法：移除 adc_app.c，然后把下面的 #if 0 / #endif 删掉即可。
+ * 所有 #include 也收进 #if 0，防止宏/extern 声明与 adc_app.h 冲突。
+ * ==========================================================================*/
 
+#if 0
+
+#include "vaux_adc.h"
+#include "safe_sm.h"
 volatile uint16_t g_vaux_raw  = 0;
 volatile uint16_t g_vaux_filt = 0;
 volatile uint16_t g_vaux_mv   = 0;
@@ -61,3 +79,4 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 
     HAL_ADC_Stop(&hadc1);
 }
+#endif /* 已停用：见文件顶部说明 */
