@@ -1,6 +1,7 @@
 #include "safe_sm.h"
 #include "freq_skip.h"    /* LLC_SoftStart_Init / softstart_done：复用扫频软启动 */
 #include "fault_log.h"    /* g_fault：硬件 FLT 触发记录，用于同步状态机 */
+#include "pi_ctrl.h"      /* PI_CTRL_Init：SOFTSTART→RUN 时积分清零 */
 
 /* ============================================================================
  *  BOR（掉电复位）—— 代码自动配置，无需任何外部工具：
@@ -20,6 +21,7 @@
 #define SAFE_FLT_FLAG_ALL  (HRTIM_FLAG_FLT1 | HRTIM_FLAG_FLT2 | HRTIM_FLAG_FLT3)
 
 volatile safe_state_t g_safe_state = SAFE_INIT;
+volatile uint32_t    g_ovp_cnt    = 0;      /* VOUT OVP 软件触发次数 */
 
 /* WAIT_AUX 中 VAUX 持续高于 REARM 的计时起点 */
 static uint8_t  aux_ok_timing = 0;
@@ -159,8 +161,9 @@ void SafeSM_Poll(void)
             {
                 SafeSM_EnterFault();
             }
-            else if (softstart_done)          /* 扫频到位 -> 定频运行 */
+            else if (softstart_done)          /* 扫频到位 -> 闭环 PI 稳压 */
             {
+                PI_CTRL_Init();             /* 积分清零，从干净起点开始调节 */
                 g_safe_state = SAFE_RUN;
             }
             break;
@@ -170,6 +173,8 @@ void SafeSM_Poll(void)
             {
                 SafeSM_EnterFault();
             }
+            /* PI_CTRL_Step() 已移至 TIM3 ISR（adc_app.c），1kHz 精确节拍执行。
+             * 状态机只负责安全检测与转移，不再执行控制算法。*/
             break;
 
         case SAFE_FAULT:

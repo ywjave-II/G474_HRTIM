@@ -1,5 +1,6 @@
 #include "adc_app.h"
-#include "safe_sm.h"     /* SafeSM_OnSample()：VAUX 滤波后喂安全状态机 */
+#include "safe_sm.h"     /* SafeSM_OnSample / SafeSM_EnterFault / g_safe_state / g_ovp_cnt */
+#include "pi_ctrl.h"     /* PI_CTRL_Step / PI_VOUT_OVP_MV：PI 闭环 + OVP 阈值 */
 #include <stdio.h>       /* 编译器内置，仅用于浮点换算，不用 printf */
 
 /* ============================================================================
@@ -162,7 +163,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             if (vout < 0.0f) { vout = 0.0f; }
             g_vout_mv = (uint16_t)(vout + 0.5f);
 
-            /* TODO: 如需 VOUT 过压软件保护，在此调用 SafeSM 或 OVP 回调 */
+            /* VOUT OVP：采样后立刻检测，覆盖 SOFTSTART + RUN。
+             * 触发 → g_ovp_cnt++ + SafeSM_EnterFault() 锁存封波，
+             * 主循环 Fault_Report_Poll 检测计数变化后打印。*/
+            {
+                uint16_t ovp_code = VOUT_MV_TO_CODE(PI_VOUT_OVP_MV);
+                if (filt > ovp_code)
+                {
+                    g_ovp_cnt++;
+                    SafeSM_EnterFault();
+                }
+            }
         }
 
         HAL_ADC_Stop(&hadc2);
@@ -246,4 +257,19 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         HAL_ADC_Stop(&hadc2);
     }
 #endif /* ADC_APP_ENABLE_IOU */
+
+    /* ---- PI 闭环：1kHz 分频执行（10kHz / 10）--------------------------- */
+#if ADC_APP_ENABLE_VOUT
+    {
+        static uint8_t pi_tick = 0;
+        if (++pi_tick >= 10U)
+        {
+            pi_tick = 0;
+            if (g_safe_state == SAFE_RUN)
+            {
+                PI_CTRL_Step();
+            }
+        }
+    }
+#endif
 }

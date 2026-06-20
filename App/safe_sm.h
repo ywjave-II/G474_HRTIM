@@ -65,6 +65,7 @@ typedef enum {
 } safe_state_t;
 
 extern volatile safe_state_t g_safe_state;
+extern volatile uint32_t    g_ovp_cnt;    /* VOUT OVP 软件触发次数 */
 
 /* 上电初始化：INIT 硬封波(HRTIM 输出 inactive + DIS 失能) + 复位状态，落到 WAIT_AUX。
  * 须在 MX_HRTIM1_Init / MX_GPIO_Init 之后、启动 PWM 之前调用。*/

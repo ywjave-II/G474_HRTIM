@@ -58,7 +58,7 @@ extern "C" {
 #define ADC_VOUT_DIV_NUM      11U       /* TODO: 按实际分压电阻填 */
 #define ADC_VOUT_DIV_DEN      1U
 #define ADC_VOUT_CAL_GAIN     1.0f
-#define ADC_VOUT_CAL_OFFSET   0.0f
+#define ADC_VOUT_CAL_OFFSET   0.0f  
 #endif
 
 /* ---- I_CYCLE：谐振腔电流 (ADC2/IN12/PB2) — 与 VOUT 互斥 ------------------------------- */

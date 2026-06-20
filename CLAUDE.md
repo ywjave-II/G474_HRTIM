@@ -24,6 +24,22 @@
 > **2026-06-17 进展（v6.2）—— VOUT 通道正式启用**：硬件改接 VOUT 分压点至 **ADC2/IN12/PB2**；
 > `adc_app.h` 开关 `ADC_APP_ENABLE_VOUT=1`；VOUT 采样数据加入 `[STAT]` 串口心跳打印；
 > 旧文件 `vout_adc.c` / `vaux_adc.c` 的 `#include` 统一收进 `#if 0`，杜绝宏/声明冲突。
+>
+> **2026-06-20 进展（v8）—— PI 重构为增量式 + 闭环实测通过**：v7 位置式 PI 因"双重积分"导致
+> bang-bang 饱和（VOUT<23.7V→120kHz，>24.7V→300kHz，中间死区）。**重构为增量式**：
+> `delta_p = Kp×(error−prev_error)`（仅响应误差变化）、`delta_i = Ki×error`（每拍独立，不累积历史）、
+> `period += delta_u`（单层累积），新增 Anti-Windup + Slew Rate 限制 + CMP4 下溢保护。**调参关键
+> 发现**：增量式 PI 中 **Ki 必须 ≥ Kp×2**，否则误差趋向目标时 P 项"恢复力"反超 I 项，瞬态修正方向
+> 反转（实测 Kp=1024/Ki=128 时空载直冲 30V）。最终 Kp=256(1.00)/Ki=512(2.00)，无死区
+> （|error|≥1 码即输出），带载闭环稳定于 23.9V。空载 Burst Mode 待实现。详见 §5c。
+>
+> **2026-06-20 进展（v8.1）—— PI/OVP 移入 TIM3 ISR + 状态机瘦身**：PI_CTRL_Step() 从主循环
+> SafeSM_Poll 移入 TIM3 10kHz ISR（1kHz 分频执行），消除主循环 printf 阻塞导致的控制节拍不确定。
+> VOUT OVP 检测同步移入 ISR（VOUT 采样后立即比较），覆盖 SOFTSTART + RUN 全状态，不再局限于 RUN。
+> OVP 触发留痕迹：`g_ovp_cnt` 计数器 + `Fault_Report_Poll` 边沿打印 + `[STAT]` 心跳可见。
+> SafeSM_Poll 退化为纯安全调度（状态转移 + PVD/FLT 检测），不再执行控制算法。
+> PI_CTRL_Step 删除内部限速器（`HAL_GetTick`/`PI_UPDATE_MS`/`last_update`），节拍由 ISR 分频保证。
+> 命令行编译路径写入 CLAUDE.md。
 
 ## 目标硬件
 
@@ -35,7 +51,7 @@
 | Flash | 512 KB |
 | RAM | 128 KB（Heap 512 B，Stack 1024 B） |
 
-应用场景：**半桥 LLC 谐振变换器**驱动固件，采用 **PFM 变频控制**。当前为**开环变频软启动**，闭环未实现。
+应用场景：**半桥 LLC 谐振变换器**驱动固件，采用 **PFM 变频控制**。已实现**增量式 PI 闭环 VOUT 稳压**（带载实测 23.9V 稳定）；空载 Burst Mode 待实现。
 
 ---
 
@@ -61,19 +77,22 @@ main()
 HRTIM1_Master_IRQHandler ─→ LLC_SoftStart_Step()   // 每次 MREP 中断扫频
    (stm32g4xx_it.c)            (App/freq_skip.c)
 
-TIM3_IRQHandler ──────────→ HAL_TIM_PeriodElapsedCallback()   // 10kHz 统一采样(VAUX+VOUT+…) → 喂 safe_sm
-   (stm32g4xx_it.c)            (App/adc_app.c)
+TIM3_IRQHandler ──────────→ HAL_TIM_PeriodElapsedCallback()   // 10kHz: ADC采样+OVP检测+PI闭环(1kHz)
+   (stm32g4xx_it.c)            (App/adc_app.c)               //       + VAUX喂安全状态机
 
 COMP2/4/6 ──(内部 Fault 线)──→ HRTIM Fault1/2/3 ──→ 硬件强制 PWM 输出 INACTIVE
                                       └─→ HRTIM1_FLT_IRQHandler → Fault_OnIRQ()  // 软件记录+点灯
                                             (App/fault_log.c)
 
-while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心跳 + 一次 [REGS] 寄存器 dump
+while(1) ─→ SafeSM_Poll()          // 纯安全状态机：转移判断 + PVD/FLT 检测，不执行控制算法
+              (App/safe_sm.c)
+         ─→ Fault_Report_Poll()   // 故障边沿 + OVP边沿 + 每秒 [STAT] 心跳(含PI/OVP) + [REGS] dump
               (App/fault_log.c)
 ```
 
-> **核心控制循环是中断驱动的**：`while(1)` 只跑 `Fault_Report_Poll()`（串口诊断打印）。
-> 真正反复执行的功率控制逻辑是中断里的 `LLC_SoftStart_Step()` 与 `HAL_TIM_PeriodElapsedCallback()`。
+> **v8.1 架构变更**：PI_CTRL_Step() 从主循环移入 **TIM3 ISR**（与 VOUT 采样同节拍，1kHz 精确分频），
+> 消除主循环 printf 阻塞导致的节拍不确定性。OVP 检测也移入 TIM3 ISR，覆盖 SOFTSTART+RUN 全状态。
+> 主循环退化为纯诊断 + 安全调度，不再执行实时控制。
 
 ---
 
@@ -233,6 +252,111 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 - **换算**：raw(0..4095) → 引脚 mV(`raw×3300/4095`) → ×分压比 → ×标定 GAIN/OFFSET → mV（浮点仅串口显示用）
 - **安全链路**：VAUX 的 EWMA 滤波码直接整数比较 22V/23V 门限，浮点不参与控制
 
+### 5c. PI 闭环控制器（`App/pi_ctrl.c/h` — 2026-06-20，v8 重构）
+
+基于 VOUT ADC 反馈的 **增量式定点整数 PI 控制器**，通过调节 HRTIM 周期实现 PFM 调压闭环。
+
+#### 背景：为什么旧版（位置式 PI）不行
+
+v7 初版采用**位置式 PI**（position form），形式为：
+
+```
+P_term = (error × Kp) ÷ 256       ← 正比于误差绝对值
+I_acc  += error × Ki               ← 积分累加
+I_term = I_acc ÷ 256               ← 正比于累积误差
+period  += P_term + I_term         ← period 自身是累积器
+```
+
+问题在于 **period 已经是一个累积器**（每次 `+=`），而 P_term 又是 error 的绝对值（也是累积量）。
+数学上这等价于 `period = Σ Σ(error)` —— **两个积分器串在一起**，加上 I 项就是三重积分。
+结果是：30~40 码的误差在 ~150ms 内就把 period 推到饱和限幅值，表现为 bang-bang：
+VOUT<目标 → 立即冲到 120kHz（下限），VOUT>目标 → 立即冲到 300kHz（上限），中间几乎无过渡。
+
+此外，位置式 PI 的 P 项即使误差不变也会每拍都输出相同值（`P=error×Kp`），相当于给积分器
+又喂了一个恒定增量——即使误差已经很小且稳定，period 仍然在变。
+
+#### 增量式 PI（Velocity Form）原理
+
+v8 重构为**增量式 PI**，核心思想：**不计算"period 应该是多少"，而是计算"period 应该改变多少"**。
+
+```
+delta_p = ((error − prev_error) × Kp) ÷ 256    ← 仅响应误差的「变化量」
+delta_i = (error × Ki) ÷ 256                    ← 每拍独立计算，不累积历史
+delta_u = delta_p + delta_i                      ← 本轮总修正量
+period  += delta_u                               ← 单层累积
+prev_error = error                               ← 存起来给下拍用
+```
+
+**关键区别：** 误差不变 → `error == prev_error` → `delta_p = 0` → period 冻住。
+只有误差变化时才产生 P 修正。这天然避免了"双重积分"。
+
+**用具体数字走一遍（Kp=256, Ki=512）：**
+
+假设软启动刚结束，period=40300(135kHz)，VOUT=25.3V，target=24V。误差约 −147 码（VOUT 偏高，需降 period 升频率来降压）。
+
+| 拍数 | error | prev_error | delta_p 计算 | delta_p | delta_i 计算 | delta_i | delta_u | 新 period | 频率 |
+|------|-------|------------|-------------|---------|-------------|---------|---------|-----------|------|
+| 1 | −147 | 0 | (−147−0)×256÷256 | **−147** | −147×512÷256 | **−294** | −441 | 39859 | 136.5kHz |
+| 2 | −110 | −147 | (−110−(−147))×1 = +37 | **+37** | −110×2 | **−220** | −183 | 39676 | 137.1kHz |
+| 3 | −70 | −110 | (−70−(−110))×1 = +40 | **+40** | −70×2 | **−140** | −100 | 39576 | 137.5kHz |
+| 4 | −30 | −70 | (−30−(−70))×1 = +40 | **+40** | −30×2 | **−60** | −20 | 39556 | 137.6kHz |
+| 5 | −5 | −30 | (−5−(−30))×1 = +25 | **+25** | −5×2 | **−10** | +15 | 39571 | 137.5kHz |
+
+解读：
+- **第 1 拍**：prev_error=0（刚初始化），误差大 → delta_p + delta_i 双大 → 大力降 period（升频降压）。
+- **第 2~4 拍**：VOUT 正在下降，误差减小。delta_p 变成 **正值**（因为 error 改善了 37 码），
+  这是 P 项的"恢复力"——VOUT 在朝目标靠近，P 项往回拉防止过冲。但 delta_i（−220, −140, −60）
+  仍然主导 → 净效果还是降 period，方向正确。
+- **第 5 拍**：误差已经很接近 0（−5 码），delta_i=−10，P 项恢复力 +25 **反超** →
+  period 微升。这就是为什么 **Ki 必须 ≥ Kp × 2**：在误差收敛阶段，I 项驱动力需要压过 P 项的恢复力。
+- 如果 Kp 是 Ki 的 8 倍（如旧版 Kp=1024/Ki=128），第 2 拍 delta_p=+224、delta_i=−85，**净+139**——
+  period 不降反升，VOUT 继续冲高，直到 30V。这就是空载过冲的根因。
+
+**为什么最后几拍 period 不再变化：** 当 error → 0，delta_i → 0，error 也可能不再变 → delta_p → 0 →
+delta_u = 0 → period 稳定。这就是收敛——系统找到了合适的稳态频率，不再振荡。
+
+#### 保护机制（全部在 `PI_CTRL_Step()` 内）
+
+| 层级 | 机制 | 触发条件 | 动作 |
+|------|------|---------|------|
+| 0 | OVP 过压 | `g_vout_filt > 27V 对应码` | 立即 `SafeSM_EnterFault()` 封波 |
+| 1 | Slew Rate 限制 | `\|delta_u\| > PI_PERIOD_SLEW_MAX` | 钳到 ±1000 tick/次 |
+| 2 | Period 硬限幅 | `period ∉ [PERIOD_MIN, PERIOD_MAX]` | 钳到边界 |
+| 3 | Anti-Windup | period≥MAX 且 error>0（或 period≤MIN 且 error<0）| 冻结积分累加器 + delta_i=0 |
+| 4 | 积分限幅 | `\|integral\| > INTEGRAL_MAX<<SHIFT` | 钳到 ±512000 |
+| 5 | CMP4 下溢保护 | period ≤ 342 | CMP4=1（防 uint32_t 回绕）|
+
+#### 当前工作参数（v8 终态）
+
+| 宏 | 值 | 实际含义 |
+|---|---|---|
+| `PI_KP_INT` | **256** | Kp = 1.00 tick/ADC码（增量式 P 增益）|
+| `PI_KI_INT` | **512** | Ki = 2.00 tick/ADC码（增量式 I 增益，无死区）|
+| `PI_SHIFT` | 8 | Q8.8 定点移位 |
+| `PI_VOUT_TARGET_MV` | 24000 | 24V 目标 |
+| `PI_VOUT_OVP_MV` | 27000 | 27V 过压封波 |
+| `PI_PERIOD_MIN` | 18133 | ≈300kHz 上限 |
+| `PI_PERIOD_MAX` | ~49455（用户调） | ≈110kHz 下限（带载需足够增益裕量）|
+| `PI_PERIOD_SLEW_MAX` | 1000 | 单次 delta_u 上限 |
+| `PI_INTEGRAL_MAX_TICK` | ±2000 | 积分累加器硬限幅 |
+| `PI_UPDATE_MS` | 1 | 1kHz 控制率 |
+
+#### `[STAT]` 串口诊断
+
+每秒打印 `PI err=%ld P=%ld I=%ld`，其中：
+- **err**：当前误差（ADC 码），正=VOUT 偏低需降频增增益，负=VOUT 偏高需升频降增益
+- **P**：本拍 delta_p（tick），误差变化大时值大，误差稳定时为 0
+- **I**：本拍 delta_i（tick），正比于当前误差
+
+> 注意：v8 的 P/I 是**单次增量**而非累积值，正常情况下在 −100~+100 范围波动，
+> 误差趋零时双双趋零。如果 P 和 I 持续为 0 但 err 非 0 → 参数可能需调整。
+
+#### 状态机集成（不变）
+
+- `SOFTSTART→RUN` 转移时 `PI_CTRL_Init()`（清零 integral / prev_error / last_update）
+- `SAFE_RUN` 内 `PI_CTRL_Step()`（每次主循环迭代，内部 1kHz 限速）
+- FAULT 时 `SafeSM_EnterFault()` 封波停止调节
+
 ### 6. ARM CMSIS-DSP 数学库
 
 - X-CUBE-ALGOBUILD 1.4.0，预编译 `libarm_cortexM4lf_math.a`（硬浮点 Cortex-M4F）
@@ -243,11 +367,30 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 | 项目 | 说明 |
 |---|---|
 | 工具链 | `arm-none-eabi-gcc`，硬浮点 `-mfloat-abi=hard -mfpu=fpv4-sp-d16` |
-| 构建 | CMake + Ninja，`Ctrl+Shift+B` 一键编译烧录 |
+| 构建 | CMake + Ninja，IDE `Ctrl+Shift+B` 一键编译烧录 |
 | 调试器 | DAPLink（CMSIS-DAP），OpenOCD `D:/openocd/daplink.cfg` |
-| GDB | `C:/Users/ywjAv/AppData/Local/stm32cube/bundles/gnu-tools-for-stm32/14.3.1+st.2/bin` |
 | 烧录 | tasks.json `Flash: OpenOCD`，编译后自动 program/verify/reset |
 | 调试 | launch.json `STM32G474 Debug`，F5 启动 Cortex-Debug |
+
+**命令行编译（非 IDE）：**
+
+```powershell
+# 设置工具链 PATH（按实际版本调整）
+$env:PATH = "C:\Users\ywjAv\AppData\Local\stm32cube\bundles\gnu-tools-for-stm32\14.3.1+st.2\bin;" +
+            "C:\Users\ywjAv\AppData\Local\stm32cube\bundles\cmake\4.3.1+st.1\bin;" +
+            "C:\Users\ywjAv\AppData\Local\stm32cube\bundles\ninja\1.13.2+st.1\bin;" +
+            $env:PATH
+
+# 新增 .c 文件后需重新 configure（CMake file(GLOB) 在 configure 时评估）
+cmake --preset Debug
+
+# 日常增量编译
+cmake --build build/Debug
+```
+
+> **注意**：CMakeLists.txt 用 `file(GLOB App/*.c)` 收集源文件，该 glob 在 **configure 时** 评估。
+> 新增 .c 文件后必须重新 `cmake --preset Debug`，否则链接报 `undefined reference`。
+> 仅修改已有文件时直接 `cmake --build build/Debug` 即可。
 
 ---
 
@@ -284,6 +427,14 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 | COMP2 迟滞 | 40 | mV | comp.c:46 | 抗抖动 |
 | HRTIM Fault Filter | FAULTFILTER_9 | — | hrtim.c:51 | 抗噪声消抖 |
 | HRTIM Fault1 极性 | LOW | — | hrtim.c:50 | VAUX 低有效；Fault2/3=HIGH |
+| PI_KP_INT | 256 | — | pi_ctrl.h | Kp=1.00 tick/ADC码（增量式 P，Q8.8）|
+| PI_KI_INT | 512 | — | pi_ctrl.h | Ki=2.00 tick/ADC码（增量式 I，Q8.8）|
+| PI_VOUT_TARGET_MV | 24000 | mV | pi_ctrl.h | 目标输出电压 |
+| PI_VOUT_OVP_MV | 27000 | mV | pi_ctrl.h | VOUT 过压保护 27V |
+| PI_PERIOD_MIN | 18133 | tick | pi_ctrl.h | 300kHz 上限（周期下限）|
+| PI_PERIOD_MAX | ~49455 | tick | pi_ctrl.h | 110kHz 下限（周期上限，用户按需调）|
+| PI_PERIOD_SLEW_MAX | 1000 | tick | pi_ctrl.h | 单次 delta_u 上限 |
+| PI_UPDATE_MS | 1 | ms | pi_ctrl.h | PI 控制周期 1kHz |
 
 ---
 
@@ -347,6 +498,17 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 
 ### 外置电源供电串口乱码 = 没共地（2026-06-06）
 - USB 供电正常，换外置电源后串口"一直打印且乱码"。真因：串口适配器 GND 与板子/外置电源没共地（地环路/地弹使 TX 电平失真）。**把串口适配器 GND 与 MCU GND 接到一起即恢复。** 功率地与信号地应单点汇接；必要时用隔离 USB-TTL。
+
+### 位置式 PI 的"双重积分"导致 bang-bang 饱和（2026-06-20，v7→v8）
+- 现象：VOUT<23.7V → 频率立即冲至 120kHz（PI_PERIOD_MAX），VOUT>24.7V → 立即冲至 300kHz（PI_PERIOD_MIN）。中间电压频率几乎不变，完全没有平滑调节。
+- 真因：旧代码 `P_term = (error × Kp) >> SHIFT`（位置式，正比于 error 绝对值）+ `llc_period += P_term + I_term`（period 自身是累积器）。数学上等价于 `period = Σ(error + Σ(error))` —— P 项给 period 累积器又喂了一个与 error 成正比的量，形成**双重积分**。30~40 码的误差在 ~150ms 内就把 period 推到饱和值。
+- 修复：重构为增量式 PI（velocity form）。`delta_p = Kp × (error − prev_error)`（仅响应误差变化量，误差不变则 delta_p=0）+ `delta_i = Ki × error`（每拍独立，不累积历史）+ `period += delta_u`。误差稳定时 delta_p=0，period 冻住，天然避免双重积分。详见 §5c 增量式 PI 原理。
+
+### 增量式 PI 的 Kp/Ki 比例约束（2026-06-20，v8 调参）
+- 现象：Kp=1024/Ki=128 时，空载上电 VOUT 直冲 30V（过压），而带载后又能稳定。示波器看频率：前几拍正确升频，随后**方向反转**（period 不降反升）。
+- 真因：增量式 P 项 `delta_p = (Δerror × Kp)` 在误差缩小时产生**正值**（"恢复力"）。当 VOUT 从高空向 target 回落，error 从 −200 变到 −150（改善 50 码），Kp=1024 时 `delta_p = +200`（反向推 period ↑），而 `delta_i = −150 × 0.5 = −75`（正向推 period ↓），净 `delta_u = +125`——**period 不降反升，频率降低，VOUT 继续冲高**。带载时负载自身消耗能量缓冲了过冲，故现象不如空载明显。
+- 解决：Ki/Kp ≥ 2:1（最终 Kp=256/Ki=512）。此时同样场景：`delta_p = +50`，`delta_i = −300`，净 `delta_u = −250`，方向始终正确。**核心原则：增量式 PI 中 I 项驱动力必须 ≥ P 项恢复力的 2 倍，否则瞬态修正方向可能反转。**
+- 空载过冲的根治方案不是再调 PI 参数，而是实现 **Burst Mode**（VOUT>OVP 阈值时直接间歇停波），因为空载时即使 period 推到 300kHz（PI_PERIOD_MIN），LLC 增益仍然太高，PI 已经饱和无力降压。
 
 ---
 
@@ -428,7 +590,7 @@ while(1) ─→ Fault_Report_Poll()   // 故障边沿打印 + 每秒 [STAT] 心�
 
 | 项 | 文件 | 状态 |
 |---|---|---|
-| 闭环控制 | `App/driver.c` | `DRIVER_Run(ref,fb)` 仅返回 `ref-fb`，**从未被调用**（孤立桩）；本版开环测增益，无闭环 |
+| 闭环控制 | `App/pi_ctrl.c` | ✅ 已实现：定点 Q8.8 PI，1kHz，VOUT 稳压 PFM 调压；`[STAT]` 可看 err/P/I |
 | ADC 反馈采样 | `App/adc_app.c/h` | ✅ 统一模块：VAUX(ADC1/PA1) 活跃，VOUT/I_CYCLE/IOU(ADC2) 条件编译待启用；旧 `vaux_adc.c` / `vout_adc.c` 均已 `#if 0` 停用保留 |
 | VAUX 标定 | `adc_app.h` | 分压比沿用 10/1，`ADC_VAUX_CAL_GAIN/OFFSET` 默认未校正——按实测两点法/单点法填 |
 | HRTIM Fault1 极性 | `hrtim.c:50` | ✅ 已改 **`LOW`(低有效)** + Filter_9，VAUX 欠压硬件闸已生效（v6）|
@@ -451,6 +613,7 @@ G474_HRTIM/
 │   ├── fault_log.c/h      HRTIM 故障中断记录 + 恢复 + 串口上报（g_fault / Fault_Rearm / Fault_Report_Poll）
 │   ├── adc_app.c/h        【v6.1】统一 ADC 采样（VAUX/VOUT/I_CYCLE/IOU 条件编译，#if 开关集中管理）
 │   ├── safe_sm.c/h        辅源安全监测 + 安全重入状态机（门限/状态机/enter_fault/PVD/BOR）见 §5c
+│   ├── pi_ctrl.c/h        【v7】PI 闭环控制器（定点 Q8.8，1kHz，VOUT 稳压 PFM 调压）
 │   ├── vaux_adc.c/h       【已停用·保留】原 VAUX 采样，已迁移至 adc_app.c（#if 0）
 │   ├── vout_adc.c/h       【已停用·保留】原 VOUT 采样，已迁移至 adc_app.c（#if 0）
 │   └── driver.c/h         控制驱动桩（未使用）
@@ -474,7 +637,10 @@ G474_HRTIM/
 - **v4（2026-06-06）**：串口诊断上报 `Fault_Report_Poll`（故障详情 + `[STAT]` + `[REGS]`）；新增 `vout_adc`（ADC1 规则组 VOUT + TIM3 10kHz 触发 + 标定校正）；串口 USART3→**USART1(PB6/PB7)**；当日完成多项硬件调试（PB12/13 短路、PB11 噪声误触发、串口共地、printf 全缓冲）。
 - **v5/v6（2026-06-12/13）**：辅源安全监测 + 安全重入状态机（`safe_sm.c`）；VAUX 采样(原 VOUT/PA1 飞线改接 24V 轨)；21V/22V/23V 三层防护；PVD + BOR 代码自配置；IWDG 看门狗；软启动 re-arm 修复；CubeMX 待办全部落地。
 - **v6.1（2026-06-14）**：统一 ADC 采样模块 `App/adc_app.c/h` 整合 VAUX/VOUT/I_CYCLE/IOU；条件编译 `#if` 开关 + 软件 `ConfigChannel` 重配，通道切换纯改头文件；vaux_adc/vout_adc 旧文件 `#if 0` 保留。
-- **v6.2（2026-06-17，当前）**：VOUT 硬件改接 ADC2/IN12/PB2 并正式启用；VOUT 采样数据加入 `[STAT]` 串口心跳；旧文件 `#include` 收进 `#if 0` 杜绝冲突；确认 10kHz ISR 余量充足（~21µs/100µs），PI 闭环可在此基础上直接加入。
+- **v6.2（2026-06-17）**：VOUT 硬件改接 ADC2/IN12/PB2 并正式启用；VOUT 采样数据加入 `[STAT]` 串口心跳；旧文件 `#include` 收进 `#if 0` 杜绝冲突；确认 10kHz ISR 余量充足（~21µs/100µs），PI 闭环可在此基础上直接加入。
+- **v7（2026-06-20 上午）**：PI 闭环控制器 `pi_ctrl.c/h` 初版（位置式 PI：`period += P_term + I_term`，定点 Q8.8，1kHz）；集成到安全状态机 `SAFE_RUN`；`[STAT]` 心跳追加 PI err/P/I 诊断。**问题**：位置式"双重积分"导致 bang-bang 饱和（VOUT 偏差几十 mV → period 直冲限幅值）。
+- **v8（2026-06-20 下午）**：**PI 重构为增量式（velocity form）**。`delta_p = Kp×(error−prev_error)` + `delta_i = Ki×error`，`period += delta_u`，消除双重积分。新增 Anti-Windup、Slew Rate 限制、CMP4 下溢保护、寄存器写入顺序修复。调参：Kp=256(1.00)/Ki=512(2.00)，Ki/Kp=2:1 保证方向始终正确。**带载闭环实测**：VOUT 稳定于 23.9V（`PI_PERIOD_MAX` 扩至 ~110kHz）。
+- **v8.1（2026-06-20 晚间，当前）**：**PI/OVP 移入 TIM3 ISR + 状态机瘦身**。PI_CTRL_Step 从主循环移入 10kHz ISR（1kHz 分频），删除内部限速器；OVP 检测同步移入 ISR，覆盖全状态，留痕迹（g_ovp_cnt + 边沿打印）；SafeSM_Poll 退化为纯安全调度。命令行编译路径固化到 CLAUDE.md。
 
 ---
 
@@ -488,12 +654,12 @@ G474_HRTIM/
 > - **辅源安全监测 + 安全重入状态机**（VAUX 22V 软封波 + COMP2/Fault1 21V 硬兜底 + 23V 重入 + PVD/BOR/IWDG）✓
 > - **统一 ADC 采样模块** `adc_app.c/h`（VAUX 活跃；VOUT/I_CYCLE/IOU 条件编译就绪；切换通道纯改头文件）✓（v6.1）
 > - **VOUT 通道正式启用**（ADC2/IN12/PB2，`ADC_APP_ENABLE_VOUT=1`，`[STAT]` 串口打印）✓（v6.2）
+> - **PI 闭环控制器（增量式，ISR 驱动）**（Kp=256/Ki=512，无死区，1kHz 精确节拍）✓（v8.1）
+> - **VOUT OVP 软件保护**（27V，TIM3 ISR 检测，覆盖全状态，留痕迹）✓（v8.1）
 > - CubeMX 所有待办已落地 ✓
 >
 > **下一步**：
-> 1. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `ADC_VAUX_CAL_GAIN/OFFSET`；
->    实测确认 22V 软封波、21V 硬封波、23V 重启各门限动作正确。
-> 2. **VOUT 标定**：填入实际分压比到 `ADC_VOUT_DIV_NUM/DEN`，按需填 `ADC_VOUT_CAL_GAIN/OFFSET`。
+> 1. **Burst Mode（空载防过冲）**：空载/轻载时 LLC 增益极高，即使 PI 升到 300kHz 也无法降压 → 需间歇停波（Burst）限制能量传输。实现思路：检测 VOUT > OVP 阈值（如 27V）→ 封波 → VOUT 衰减到回滞点 → 恢复 PWM → 循环。
+> 2. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `ADC_VAUX_CAL_GAIN/OFFSET`；实测确认 22V 软封波、21V 硬封波、23V 重启各门限动作正确。
 > 3. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——消除原 OCP/OVP 噪声误触发。
-> 4. **闭环**：反馈 → 主循环/定时中断跑 PID/`DRIVER_Run` → 动态调 HRTIM 周期（PFM 调压）；
->    启用 I_CYCLE/IOU(ADC2) 作为电流反馈。
+> 4. **电流闭环/双环（远期）**：启用 I_CYCLE/IOU(ADC2) 作为电流内环反馈。
