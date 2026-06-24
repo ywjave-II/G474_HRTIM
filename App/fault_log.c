@@ -1,9 +1,8 @@
 #include "fault_log.h"
 #include "freq_skip.h"     /* llc_period / softstart_done，用于打印实际开关频率 */
-#include "adc_app.h"       /* g_vaux_raw / g_vaux_filt / g_vaux_mv，用于打印 VAUX 采样；
-                             * 若启用 VOUT/I_CYCLE/IOU，对应全局变量也在此提供 */
+#include "adc_app.h"       /* g_vaux_raw / g_vaux_filt / g_vaux_mv，用于打印 VAUX 采样 */
 #include "safe_sm.h"       /* g_safe_state，打印安全状态机当前状态 */
-#include "pi_ctrl.h"        /* g_pi，打印 PI 闭环误差/P/I 项 */
+#include "pi_ctrl.h"       /* g_pi（float 诊断字段：error/delta_p/delta_i/ovp_count/vout_filt）*/
 #include <stdio.h>         /* printf -> USART1（io_retarget.c 重定向）*/
 
 /* 等效计数时钟：HRTIM MUL32，5440 MHz。fsw = 5440e6 / period */
@@ -110,17 +109,18 @@ void Fault_Report_Poll(void)
         printf("====================================================\r\n");
     }
 
-    /* ---- 1b) VOUT OVP 边沿打印：ISR 检测到过压时 g_ovp_cnt++，此处打印 ---- */
+    /* ---- 1b) VOUT OVP 边沿打印：ISR 中 PI_CTRL_Step Step 0 检测到过压时
+     *         g_pi.ovp_count++，此处检测变化并打印。OVP 阈值见 pi_ctrl.h。 ---- */
     {
         static uint32_t last_ovp = 0;
-        uint32_t ovp = g_ovp_cnt;
+        uint32_t ovp = g_pi.ovp_count;          /* volatile 快照 */
         if (ovp != last_ovp)
         {
             last_ovp = ovp;
-            printf("\r\n==== VOUT OVP TRIGGER! (software, VOUT > %lu mV) ====\r\n",
-                   (unsigned long)PI_VOUT_OVP_MV);
+            printf("\r\n==== VOUT OVP TRIGGER! (software, VOUT > %.0f mV) ====\r\n",
+                   (double)PI_VOUT_OVP_MV);
             printf("  OVP COUNT : %lu\r\n", (unsigned long)ovp);
-            printf("  VOUT filt : %u (%u mV)\r\n", g_vout_filt, g_vout_mv);
+            printf("  VOUT filt : %.1f mV\r\n", (double)g_pi.vout_filt);
             printf("====================================================\r\n");
         }
     }
@@ -137,28 +137,30 @@ void Fault_Report_Poll(void)
         };
         safe_state_t st = g_safe_state;
 #if ADC_APP_ENABLE_VOUT
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | VOUT raw=%u filt=%u (%u mV) | PI err=%ld P=%ld I=%ld\r\n",
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,
                g_fault.tripped,
                (unsigned long)g_fault.total_cnt,
-               (unsigned long)g_ovp_cnt,
+               (unsigned long)g_pi.ovp_count,
                g_vaux_raw, g_vaux_filt, g_vaux_mv,
-               g_vout_raw, g_vout_filt, g_vout_mv,
-               (long)g_pi.error, (long)g_pi.p_term, (long)g_pi.i_term);
+               g_pi.vout_raw, (double)g_pi.vout_filt,
+               (double)g_pi.error, (double)g_pi.delta_p, (double)g_pi.delta_i,
+               (unsigned int)g_pi.kp_segment);
 #else
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | PI err=%ld P=%ld I=%ld\r\n",
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,
                g_fault.tripped,
                (unsigned long)g_fault.total_cnt,
-               (unsigned long)g_ovp_cnt,
+               (unsigned long)g_pi.ovp_count,
                g_vaux_raw, g_vaux_filt, g_vaux_mv,
-               (long)g_pi.error, (long)g_pi.p_term, (long)g_pi.i_term);
+               (double)g_pi.error, (double)g_pi.delta_p, (double)g_pi.delta_i,
+               (unsigned int)g_pi.kp_segment);
 #endif
     }
 

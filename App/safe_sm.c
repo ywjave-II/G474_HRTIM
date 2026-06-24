@@ -21,7 +21,7 @@
 #define SAFE_FLT_FLAG_ALL  (HRTIM_FLAG_FLT1 | HRTIM_FLAG_FLT2 | HRTIM_FLAG_FLT3)
 
 volatile safe_state_t g_safe_state = SAFE_INIT;
-volatile uint32_t    g_ovp_cnt    = 0;      /* VOUT OVP 软件触发次数 */
+/* 注：g_ovp_cnt 已迁移至 pi_ctrl_t.ovp_count（pi_ctrl.c），定时在 PI_CTRL_Step 的 Step 0 递增。*/
 
 /* WAIT_AUX 中 VAUX 持续高于 REARM 的计时起点 */
 static uint8_t  aux_ok_timing = 0;
@@ -126,6 +126,15 @@ void SafeSM_Poll(void)
         {
             SafeSM_EnterFault();
         }
+    }
+
+    /* OVP 软件触发标志（ISR 中 PI_CTRL_Step Step 0 置位）。
+     * ISR 已直接关 HRTIM 输出（硬快路径），此处补 DIS 失能 + 状态转移。*/
+    if (g_fault_request)
+    {
+        g_fault_request = 0;          /* 消费标志 */
+        SafeSM_EnterFault();
+        return;                       /* 本周期不再处理其他状态转移 */
     }
 
     switch (g_safe_state)

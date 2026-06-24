@@ -25,6 +25,7 @@ set(MX_Application_Src
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/adc.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/comp.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/dac.c
+    ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/dma.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/hrtim.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/iwdg.c
     ${CMAKE_CURRENT_SOURCE_DIR}/../../Src/tim.c

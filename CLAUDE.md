@@ -40,6 +40,24 @@
 > SafeSM_Poll 退化为纯安全调度（状态转移 + PVD/FLT 检测），不再执行控制算法。
 > PI_CTRL_Step 删除内部限速器（`HAL_GetTick`/`PI_UPDATE_MS`/`last_update`），节拍由 ISR 分频保证。
 > 命令行编译路径写入 CLAUDE.md。
+>
+> **2026-06-24 进展（v9）—— PI 浮点化重写 + VOUT ADC2 DMA 硬件触发**：
+> **PI 控制器**：Q8.8 定点 → 全 float 实现（利用 M4F FPU）；`pi_ctrl_t` 结构体重构（mV/tick
+> 物理单位 + 累计统计）；分段 Kp 新增 200 tick 滞回防 chattering；死区（±30mV）内持续更新
+> prev_error 防退出冲击；Anti-Windup 正确禁 delta_i（而非操作不参与输出的 integral 累加器）；
+> I 项浮点无截断（小误差也能产生非零增量）；OVP 快慢分离（ISR 置 g_fault_request + 直接关
+> HRTIM 输出，主循环 SafeSM_Poll 补 DIS + 状态转移）；新增 PI_CTRL_GetDiagSnapshot()
+> （PRIMASK 临界区保护）；9 个 _Static_assert 编译期检查。
+> **VOUT ADC**：CubeMX 配置 TIM3 TRGO 硬件触发 ADC2 + DMA1_Channel1 循环搬运到
+> `g_adc_dma_buf[0]`；`PI_CTRL_Step()` 15 步执行流（Step 0 OVP 10kHz → Step 1 分频 →
+> Step 2~15 1kHz PI），直接从 DMA buffer 读取，不再软件轮询；buffer 定义在 adc_app.c、
+> extern 引用在 pi_ctrl.c，所有权清晰。
+> **HRTIM 写入统一**：`HRTIM_SetLLCPeriod()` 提取到 `freq_skip.c`，PI 和软启动共用。
+> **首次闭环实测**：RLOAD=55Ω，VOUT 稳定在 ~24V（period≈47k/115kHz），PI err/dP/dI
+> 响应正常。**发现 LLC 工作频率 115kHz 远低于原假设谐振点 130kHz**，真实 fr 可能在 135~145kHz；
+> 匝比 8:1（24:3）+ 381V 母线 + 0.525V 二极管压降：Vout(fr)≈23.29V，需增益 1.03 才到 24V；
+> 120kHz(PI_MAX=45300) 已无法满足 → 放宽至 50000(108.8kHz) → 进入容性区 → FLT3 OCP
+> 反复触发（已知问题，见踩坑记录）。下一步：实测真实 fr + 修正 PI_PERIOD_MAX + FAULT 锁死。
 
 ## 目标硬件
 
@@ -77,8 +95,10 @@ main()
 HRTIM1_Master_IRQHandler ─→ LLC_SoftStart_Step()   // 每次 MREP 中断扫频
    (stm32g4xx_it.c)            (App/freq_skip.c)
 
-TIM3_IRQHandler ──────────→ HAL_TIM_PeriodElapsedCallback()   // 10kHz: ADC采样+OVP检测+PI闭环(1kHz)
-   (stm32g4xx_it.c)            (App/adc_app.c)               //       + VAUX喂安全状态机
+TIM3 (10kHz) ──TRGO脉冲──→ ADC2 硬件触发转换 ──DMA──→ g_adc_dma_buf[0]   // VOUT：硬件全自动
+   │
+   └──TIM3_IRQHandler ──→ HAL_TIM_PeriodElapsedCallback()             // 10kHz: VAUX轮询采样
+        (stm32g4xx_it.c)     (App/adc_app.c)                          //       + PI_CTRL_Step()(内部分频)
 
 COMP2/4/6 ──(内部 Fault 线)──→ HRTIM Fault1/2/3 ──→ 硬件强制 PWM 输出 INACTIVE
                                       └─→ HRTIM1_FLT_IRQHandler → Fault_OnIRQ()  // 软件记录+点灯
@@ -427,14 +447,20 @@ cmake --build build/Debug
 | COMP2 迟滞 | 40 | mV | comp.c:46 | 抗抖动 |
 | HRTIM Fault Filter | FAULTFILTER_9 | — | hrtim.c:51 | 抗噪声消抖 |
 | HRTIM Fault1 极性 | LOW | — | hrtim.c:50 | VAUX 低有效；Fault2/3=HIGH |
-| PI_KP_INT | 256 | — | pi_ctrl.h | Kp=1.00 tick/ADC码（增量式 P，Q8.8）|
-| PI_KI_INT | 512 | — | pi_ctrl.h | Ki=2.00 tick/ADC码（增量式 I，Q8.8）|
-| PI_VOUT_TARGET_MV | 24000 | mV | pi_ctrl.h | 目标输出电压 |
-| PI_VOUT_OVP_MV | 27000 | mV | pi_ctrl.h | VOUT 过压保护 27V |
-| PI_PERIOD_MIN | 18133 | tick | pi_ctrl.h | 300kHz 上限（周期下限）|
-| PI_PERIOD_MAX | ~49455 | tick | pi_ctrl.h | 110kHz 下限（周期上限，用户按需调）|
-| PI_PERIOD_SLEW_MAX | 1000 | tick | pi_ctrl.h | 单次 delta_u 上限 |
-| PI_UPDATE_MS | 1 | ms | pi_ctrl.h | PI 控制周期 1kHz |
+| PI_KP_HIGH | 1.5 | tick/mV | pi_ctrl.h | 高频段（period < SEG1=24000/~227kHz）|
+| PI_KP_MID | 1.0 | tick/mV | pi_ctrl.h | 中频段（SEG1~SEG2=24000~36000）|
+| PI_KP_LOW | 0.5 | tick/mV | pi_ctrl.h | 低频段（period > SEG2=36000/~151kHz）|
+| PI_KI | 0.05 | tick/(mV·ms) | pi_ctrl.h | 积分增益（控制周期固定 1ms）|
+| PI_VOUT_TARGET_MV | 24000.0 | mV | pi_ctrl.h | 目标输出电压 |
+| PI_VOUT_OVP_MV | 28000.0 | mV | pi_ctrl.h | VOUT 过压保护阈值 |
+| PI_PERIOD_MIN | 18133.0 | tick | pi_ctrl.h | 300kHz 上限（周期下限）|
+| PI_PERIOD_MAX | 50000.0 | tick | pi_ctrl.h | 108.8kHz 下限（周期上限，v9 实测用值；⚠️ 低于谐振点，待修正）|
+| PI_SLEW_MAX | 300.0 | tick/次 | pi_ctrl.h | 单次 delta_u 上限 |
+| PI_DEADBAND_MV | 30.0 | mV | pi_ctrl.h | 死区 ±30mV |
+| PI_EWMA_ALPHA | 0.1 | — | pi_ctrl.h | VOUT EWMA 滤波系数（τ≈10ms@1kHz）|
+| PI_DECIMATION | 10 | 次 | pi_ctrl.h | 10kHz→1kHz 分频比 |
+| PI_SEG_HYST | 200.0 | tick | pi_ctrl.h | Kp 分段滞回带宽度 |
+| VOUT DMA buffer | `g_adc_dma_buf[2]` | — | adc_app.c | ADC2 DMA 循环搬运，`PI_CTRL_Step()` 消费 |
 
 ---
 
@@ -503,6 +529,70 @@ cmake --build build/Debug
 - 现象：VOUT<23.7V → 频率立即冲至 120kHz（PI_PERIOD_MAX），VOUT>24.7V → 立即冲至 300kHz（PI_PERIOD_MIN）。中间电压频率几乎不变，完全没有平滑调节。
 - 真因：旧代码 `P_term = (error × Kp) >> SHIFT`（位置式，正比于 error 绝对值）+ `llc_period += P_term + I_term`（period 自身是累积器）。数学上等价于 `period = Σ(error + Σ(error))` —— P 项给 period 累积器又喂了一个与 error 成正比的量，形成**双重积分**。30~40 码的误差在 ~150ms 内就把 period 推到饱和值。
 - 修复：重构为增量式 PI（velocity form）。`delta_p = Kp × (error − prev_error)`（仅响应误差变化量，误差不变则 delta_p=0）+ `delta_i = Ki × error`（每拍独立，不累积历史）+ `period += delta_u`。误差稳定时 delta_p=0，period 冻住，天然避免双重积分。详见 §5c 增量式 PI 原理。
+
+### PI_PERIOD_MAX 过低导致 LLC 进入容性区 → FLT3 过流反复触发（2026-06-23，v8.2）
+
+- **现象**：上电闭环测试中 FLT3(COMP6/PB11, OCP) 反复触发。FAULT 后输出关闭 → VAUX≥23V → 自动跳 WAIT_AUX → 50ms 后清锁存重开 PWM → FLT3 立即再次触发 → 死循环。
+- **调试手法**：关闭 VOUT 采样（`ADC_APP_ENABLE_VOUT=0`，同时切断 PI_CTRL_Step 编译和 VOUT OVP 检测）→ 系统回到纯开环 300k→139.5kHz 定频。开环测试 FLT3 **不再触发**，确认问题与 PI 闭环相关，非硬件噪声。
+- **根因**：`PI_PERIOD_MAX = 50000`（≈108.8kHz），而 LLC 谐振频率 ≈130kHz（period≈41846）。PI 检测到 VOUT 偏低时增大 period（降频靠近谐振点增增益），若负载较重，PI 可把频率一路压到 108kHz——**远低于谐振点，进入容性区**，引发：
+  - 硬开关（ZVS 丢失）→ 原边电流尖峰
+  - PB11（原边电流采样）超过 COMP6 阈值 2.82V → FLT3 过流保护正确触发
+  - 开环频率 139.5kHz(period=39100) 在谐振点之上感性区，ZVS 正常工作，故不触发
+- **附带发现**：
+  1. `FAULT` 状态机出口逻辑有误：`SAFE_FAULT` 在 `g_vaux_filt >= VAUX_REARM_CODE` 时无条件跳 `SAFE_WAIT_AUX`，原意是为 VAUX 欠压(FLT1)恢复留重启路径，但实际上对 FLT2/FLT3(OCP/OVP) 也放行，造成"故障→自动清锁存→重启→再次故障"的死循环。**正确做法**：FAULT 应锁死无软件出口，仅掉电冷启恢复。
+  2. `main.c:169-170`：`HAL_DAC_Start(&hdac4, DAC1_CHANNEL_2)` 和 `HAL_DAC_SetValue(&hdac4, DAC1_CHANNEL_2, ...)` 写错了通道宏（应为 `DAC4_CHANNEL_2`）。由于 STM32G4 HAL 中 `DAC1_CHANNEL_2` 与 `DAC4_CHANNEL_2` 恰好同值 `DAC_CHANNEL_2=0x10`，功能上碰巧正确，但属复制粘贴错误。
+  3. `comp.c:100`：COMP6 迟滞仍为 `COMP_HYSTERESIS_20MV`，而 COMP2 已升到 40mV。PB11 高阻模拟输入，噪声容限偏低。
+  4. `main.c` 上电时序：`HAL_COMP_Start(&hcomp6)` 早于 `HAL_DAC_SetValue(&hdac4, ..., 3500)`，COMP6 先启动时 DAC 输出可能为不确定值。虽然此时 Fault 整体已屏蔽，但顺序上应先设 DAC 阈值再启 COMP。
+- **修复方向**：
+  1. `PI_PERIOD_MAX` 从 50000 修改为 40000（≈136kHz），保留谐振点之上安全余量（≥6kHz 裕度）
+  2. `SAFE_FAULT` 状态改为锁死无出口（删掉 `g_vaux_filt >= VAUX_REARM_CODE` 的跳转），仅掉电冷启恢复
+  3. （可选）`main.c` DAC4 通道宏修正、COMP6 迟滞升 40mV、上电时序调整
+
+### LLC 硬件参数与谐振点实测（2026-06-24，v9 闭环调试）
+
+- **工况**：55Ω 负载，24V 目标 ≈ 10.5W。软启动 300k→135kHz 后 PI 接手闭环。
+
+- **关键硬件参数**：
+  - 变压器匝比：Np:Ns = 24:3 → N = 8:1
+  - 半桥母线电压 Vbus = 381V
+  - 副边二极管导通压降 Vf ≈ 0.525V（推测为 SiC SBD）
+  - 设计串联谐振点 fr = 130kHz
+
+- **谐振点理论输出电压**：
+  ```
+  Vout(fr, M=1) = Vbus / (2 × N) − Vf
+                = 381 / 16 − 0.525
+                = 23.81 − 0.525
+                = 23.29V
+  ```
+  理论值差 0.71V 到 24V，需额外增益 1.03。
+
+- **实测运行点**：
+  - `PI_PERIOD_MAX = 45300(120kHz)`：VOUT 仅能到 23.5V，增益不够
+  - `PI_PERIOD_MAX = 50000(108.8kHz)`：VOUT 可达 24V，但稳态运行在 ~47k(115kHz)
+  - 120kHz 时增益 > 1（VOUT=23.5V > 23.29V 理论值）→ **120kHz 已低于真实 fr**
+  - 推测真实 fr ≈ 135~145kHz，远高于原设计 130kHz
+
+- **FLT3 反复触发链条**：
+  ```
+  负载瞬态 → VOUT 下跌 → PI 增 period（降频）
+  → period → 50000(108.8kHz)
+  → 穿过真实 fr → 进入容性区 → ZVS 丢失 → 硬开关
+  → 原边电流尖峰 → COMP6/PB11 超阈值 → FLT3 锁死
+  ```
+  FAULT 后 VAUX≥23V → 自动重启 → PI 再次推 period → 再次 FLT3（每 ~3s 循环一次）
+
+- **根因总结**：
+  1. 真实 fr 可能比设计值 130kHz 高 10~15kHz（Cr/Lr 实际偏差或 MLCC DC bias）
+  2. 匝比 8:1 在 381V 母线 + 二极管压降下，谐振点增益 1 时理论 VOUT 仅 23.29V
+  3. `PI_PERIOD_MAX=50000` 允许频率降到 fr 以下 → 容性区
+  4. `SAFE_FAULT` 自动重启机制让 OCP 故障陷入死循环
+
+- **下一步**：
+  - 空载开环扫频，示波器看原边电流与电压同相点 → 确认真实 fr
+  - `PI_PERIOD_MAX` 设在真实 fr 之上 3~5kHz
+  - FAULT 状态改为锁死不自动恢复
+  - 如 VOUT 真实 fr 下仍不够 24V，需改匝比或调母线电压
 
 ### 增量式 PI 的 Kp/Ki 比例约束（2026-06-20，v8 调参）
 - 现象：Kp=1024/Ki=128 时，空载上电 VOUT 直冲 30V（过压），而带载后又能稳定。示波器看频率：前几拍正确升频，随后**方向反转**（period 不降反升）。
@@ -590,14 +680,18 @@ cmake --build build/Debug
 
 | 项 | 文件 | 状态 |
 |---|---|---|
-| 闭环控制 | `App/pi_ctrl.c` | ✅ 已实现：定点 Q8.8 PI，1kHz，VOUT 稳压 PFM 调压；`[STAT]` 可看 err/P/I |
-| ADC 反馈采样 | `App/adc_app.c/h` | ✅ 统一模块：VAUX(ADC1/PA1) 活跃，VOUT/I_CYCLE/IOU(ADC2) 条件编译待启用；旧 `vaux_adc.c` / `vout_adc.c` 均已 `#if 0` 停用保留 |
-| VAUX 标定 | `adc_app.h` | 分压比沿用 10/1，`ADC_VAUX_CAL_GAIN/OFFSET` 默认未校正——按实测两点法/单点法填 |
-| HRTIM Fault1 极性 | `hrtim.c:50` | ✅ 已改 **`LOW`(低有效)** + Filter_9，VAUX 欠压硬件闸已生效（v6）|
-| 故障恢复 | `App/fault_log.c` | 已有 `Fault_Rearm()` 可手动恢复；**无自动恢复**（对 OCP/OVP 是有意为之）；尚无触发入口（如串口指令） |
-| 故障上报 | `App/fault_log.c` | ✅ 已实现 `Fault_Report_Poll()` 串口打印（故障详情 + [STAT] + [REGS]）|
-| Fault 消抖 | `hrtim.c:51` | ✅ 已用 `FAULTFILTER_9` + COMP2 迟滞 40MV（v6）；剩 COMP4/6 迟滞 + PB11 RC 可选 |
-| 主循环 | `main.c` | `while(1)` 跑 `Fault_Report_Poll()`（仅诊断打印，无控制逻辑）|
+| 闭环控制 | `App/pi_ctrl.c` | ✅ 已实现：float 增量式 PI，分段 Kp 滞回 + 死区 + Anti-Windup + Slew Rate，1kHz ISR 驱动 |
+| VOUT ADC DMA | `adc_app.c` / CubeMX | ✅ 已实现：TIM3 TRGO 硬件触发 ADC2 + DMA1_Ch1 Circular → `g_adc_dma_buf[0]` |
+| HRTIM 统一写入 | `freq_skip.c` | ✅ 已实现：`HRTIM_SetLLCPeriod()` 供 PI 和软启动共用 |
+| VOUT 采样 | `adc_app.c/h` | ✅ 统一模块：VAUX(ADC1/PA1) 活跃，VOUT(ADC2 DMA) 活跃，I_CYCLE/IOU 待启用 |
+| **真实谐振频率 fr 未知** | 硬件 | ⚠️ 设计值 130kHz，实测工作点 ~115kHz 暗示真实 fr 可能在 135~145kHz。需空载扫频确认 |
+| **FAULT 自动重启死循环** | `safe_sm.c` | ⚠️ FLT3 OCP 触发后 VAUX≥23V 自动重启 → PI 再推 period 到 50000 → 再触发。FAULT 应锁死 |
+| **PI_PERIOD_MAX 需修正** | `pi_ctrl.h` | ⚠️ 当前 50000(108.8kHz)，低于谐振点。确认真实 fr 后应设在其之上 3~5kHz |
+| VAUX 标定 | `adc_app.h` | ⚠️ `ADC_VAUX_CAL_GAIN/OFFSET` 默认未校正 |
+| 故障恢复 | `fault_log.c` | 已有 `Fault_Rearm()`，无自动恢复（对 OCP/OVP 有意）；尚无触发入口（如串口指令） |
+| Fault 消抖 | `hrtim.c` | ✅ 已用 `FAULTFILTER_9` + COMP2 迟滞 40MV；COMP4/6 仍 20MV + PB11 RC 待补 |
+| Burst Mode（空载防过冲）| `pi_ctrl.c` | 🔒 待实现 |
+| 电流闭环/双环 | `adc_app.c` | 🔒 待 I_CYCLE/IOU 硬件接线 + 启用 |
 
 ---
 
@@ -640,7 +734,8 @@ G474_HRTIM/
 - **v6.2（2026-06-17）**：VOUT 硬件改接 ADC2/IN12/PB2 并正式启用；VOUT 采样数据加入 `[STAT]` 串口心跳；旧文件 `#include` 收进 `#if 0` 杜绝冲突；确认 10kHz ISR 余量充足（~21µs/100µs），PI 闭环可在此基础上直接加入。
 - **v7（2026-06-20 上午）**：PI 闭环控制器 `pi_ctrl.c/h` 初版（位置式 PI：`period += P_term + I_term`，定点 Q8.8，1kHz）；集成到安全状态机 `SAFE_RUN`；`[STAT]` 心跳追加 PI err/P/I 诊断。**问题**：位置式"双重积分"导致 bang-bang 饱和（VOUT 偏差几十 mV → period 直冲限幅值）。
 - **v8（2026-06-20 下午）**：**PI 重构为增量式（velocity form）**。`delta_p = Kp×(error−prev_error)` + `delta_i = Ki×error`，`period += delta_u`，消除双重积分。新增 Anti-Windup、Slew Rate 限制、CMP4 下溢保护、寄存器写入顺序修复。调参：Kp=256(1.00)/Ki=512(2.00)，Ki/Kp=2:1 保证方向始终正确。**带载闭环实测**：VOUT 稳定于 23.9V（`PI_PERIOD_MAX` 扩至 ~110kHz）。
-- **v8.1（2026-06-20 晚间，当前）**：**PI/OVP 移入 TIM3 ISR + 状态机瘦身**。PI_CTRL_Step 从主循环移入 10kHz ISR（1kHz 分频），删除内部限速器；OVP 检测同步移入 ISR，覆盖全状态，留痕迹（g_ovp_cnt + 边沿打印）；SafeSM_Poll 退化为纯安全调度。命令行编译路径固化到 CLAUDE.md。
+- **v8.1（2026-06-20 晚间）**：**PI/OVP 移入 TIM3 ISR + 状态机瘦身**。PI_CTRL_Step 从主循环移入 10kHz ISR（1kHz 分频），删除内部限速器；OVP 检测同步移入 ISR，覆盖全状态，留痕迹（g_ovp_cnt + 边沿打印）；SafeSM_Poll 退化为纯安全调度。命令行编译路径固化到 CLAUDE.md。
+- **v9（2026-06-24，当前）**：**PI 浮点化重写 + VOUT ADC2 DMA 硬件触发**。PI 全部改用 float（分段 Kp 滞回/死区/浮点无截断 I/Anti-Windup 修复）；VOUT 改为 TIM3 TRGO 硬件触发 ADC2 + DMA 循环搬运，ISR 直接读 buffer；`HRTIM_SetLLCPeriod()` 统一写入；`g_fault_request` OVP 快慢分离。**首次闭环实测**：55Ω 负载下 VOUT 稳定 ~24V，工作频率 ~115kHz（period≈47k）远低于设计谐振点 130kHz；PI_PERIOD_MAX=50000(108.8kHz) 下 FLT3 反复触发（容性区 ZVS 丢失）。调试发现真实 fr 可能在 135~145kHz，匝比 8:1 + 381V 母线 + 0.525V 二极管压降 → Vout(fr)≈23.29V 理论上不够 24V —— 问题在 LLC 增益而非 PI 控制。下一步：实测真实 fr + 修正 PI_PERIOD_MAX + FAULT 锁死不自动重启。
 
 ---
 
@@ -652,14 +747,17 @@ G474_HRTIM/
 > - 三路比较器硬件 OCP/OVP/VAUX_UVP 保护（锁死型 + Filter_9 + 迟滞）✓
 > - 故障软件记录 + **串口上报** `Fault_Report_Poll`（故障详情 + `[STAT]` + `[REGS]`）✓
 > - **辅源安全监测 + 安全重入状态机**（VAUX 22V 软封波 + COMP2/Fault1 21V 硬兜底 + 23V 重入 + PVD/BOR/IWDG）✓
-> - **统一 ADC 采样模块** `adc_app.c/h`（VAUX 活跃；VOUT/I_CYCLE/IOU 条件编译就绪；切换通道纯改头文件）✓（v6.1）
-> - **VOUT 通道正式启用**（ADC2/IN12/PB2，`ADC_APP_ENABLE_VOUT=1`，`[STAT]` 串口打印）✓（v6.2）
-> - **PI 闭环控制器（增量式，ISR 驱动）**（Kp=256/Ki=512，无死区，1kHz 精确节拍）✓（v8.1）
-> - **VOUT OVP 软件保护**（27V，TIM3 ISR 检测，覆盖全状态，留痕迹）✓（v8.1）
-> - CubeMX 所有待办已落地 ✓
+> - **统一 ADC 采样模块** `adc_app.c/h`（VAUX 活跃；VOUT/I_CYCLE/IOU 条件编译就绪）✓（v6.1）
+> - **VOUT 通道正式启用**（ADC2/IN12/PB2，`ADC_APP_ENABLE_VOUT=1`）✓（v6.2）
+> - **PI 闭环控制器（增量式，float，ISR 驱动）**：分段 Kp 滞回 + 死区 + Anti-Windup + Slew Rate + OVP 快慢分离 ✓（v9）
+> - **VOUT ADC2 DMA 硬件触发**：TIM3 TRGO → ADC2 → DMA Circular → `g_adc_dma_buf[0]`，ISR 直接读 ✓（v9）
+> - **CubeMX 所有待办已落地**：TIM3 TRGO、ADC2 DMA、DMA Circular 等已配置并重新生成 ✓
+> - **首次闭环实测通过**：55Ω 负载 VOUT 稳定 ~24V，PI 响应正常（dI=10~15 tick/ms）
 >
 > **下一步**：
-> 1. **Burst Mode（空载防过冲）**：空载/轻载时 LLC 增益极高，即使 PI 升到 300kHz 也无法降压 → 需间歇停波（Burst）限制能量传输。实现思路：检测 VOUT > OVP 阈值（如 27V）→ 封波 → VOUT 衰减到回滞点 → 恢复 PWM → 循环。
-> 2. **VAUX 标定 + 门限实测验证**：示波器/万用表核对 [STAT] 的 VAUX mV，按需填 `ADC_VAUX_CAL_GAIN/OFFSET`；实测确认 22V 软封波、21V 硬封波、23V 重启各门限动作正确。
-> 3. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——消除原 OCP/OVP 噪声误触发。
-> 4. **电流闭环/双环（远期）**：启用 I_CYCLE/IOU(ADC2) 作为电流内环反馈。
+> 1. **实测真实 fr（高优先级）**：空载开环扫频（示波器看原边电流/电压同相点），确认真实串联谐振频率。当前数据暗示 fr 在 135~145kHz，而非设计值 130kHz
+> 2. **修正 PI_PERIOD_MAX**：确认真实 fr 后，`PI_PERIOD_MAX` 设在 fr 之上 3~5kHz 安全余量，防止 PI 将频率推入容性区
+> 3. **FAULT 锁死不自动重启**：`SAFE_FAULT` 状态删掉 `g_vaux_filt >= VAUX_REARM_CODE` 的跳转，仅掉电冷启恢复（防止 OCP 死循环）
+> 4. **Burst Mode（空载防过冲）**：空载/轻载时 LLC 增益极高，即使 PI 升到 300kHz 也无法降压 → 需间歇停波
+> 5. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——补强原 OCP/OVP 噪声裕量
+> 6. **电流闭环/双环（远期）**：启用 I_CYCLE/IOU(ADC2) 作为电流内环反馈

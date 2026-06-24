@@ -84,11 +84,45 @@ void LLC_SoftStart_Step(void)
             softstart_done = 1;
         }
 
-        
-        HRTIM1->sTimerxRegs[0].PERxR = llc_period;
-        HRTIM1->sTimerxRegs[2].PERxR = llc_period;
-        HRTIM1->sTimerxRegs[2].CMP1xR = llc_period / 2;       // 相位偏移跟随
-        HRTIM1->sTimerxRegs[2].CMP4xR = llc_period - 342;     // 关断点跟随
-        HRTIM1->sMasterRegs.MPER = llc_period;
+        HRTIM_SetLLCPeriod(llc_period);
     }
+}
+
+/* ============================================================================
+ *  HRTIM_SetLLCPeriod — 统一的 HRTIM 周期寄存器写入
+ *  --------------------------------------------------------------------------
+ *  供 PI 闭环（pi_ctrl.c）和软启动（LLC_SoftStart_Step）共同调用。
+ *
+ *  写入顺序（已验证，勿改）：
+ *    1. TimerA PERxR（预装载）
+ *    2. TimerC PERxR（预装载）
+ *    3. TimerC CMP1 = period/2（180° 移相）
+ *    4. TimerC CMP4 = period - PI_CMP4_OFFSET（关断点，有下溢保护）
+ *    5. Master MPER（最后写有效寄存器）
+ *
+ *  注意：TimerA CMP1 不写 — InterleavedMode=DUAL 由硬件自动设为 PER/2。
+ *        预装载值在下一 MREP 更新事件时自动搬运到 active 寄存器。
+ *
+ *  CMP4 下溢保护：正常 period > PI_CMP4_OFFSET（最小值 18133 >> 342）。
+ *  若 period ≤ offset，CMP4 设为 1，防止 uint32_t 回绕到接近 4e9。
+ * ==========================================================================*/
+void HRTIM_SetLLCPeriod(uint32_t period)
+{
+    uint32_t cmp4;
+
+    if (period > PI_CMP4_OFFSET)
+    {
+        cmp4 = period - PI_CMP4_OFFSET;
+    }
+    else
+    {
+        cmp4 = 1U;   /* 下溢保护：防 uint32_t 回绕 */
+    }
+
+    /* 先写预装载寄存器（PERxR / CMPxR），最后写 Master 有效寄存器（MPER）*/
+    HRTIM1->sTimerxRegs[0].PERxR = period;       /* Timer A */
+    HRTIM1->sTimerxRegs[2].PERxR = period;       /* Timer C */
+    HRTIM1->sTimerxRegs[2].CMP1xR = period / 2U; /* 180° 移相 */
+    HRTIM1->sTimerxRegs[2].CMP4xR = cmp4;        /* 关断点（下溢保护）*/
+    HRTIM1->sMasterRegs.MPER = period;           /* Master 最后写 */
 }

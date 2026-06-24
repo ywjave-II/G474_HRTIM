@@ -1,7 +1,8 @@
 #include "adc_app.h"
-#include "safe_sm.h"     /* SafeSM_OnSample / SafeSM_EnterFault / g_safe_state / g_ovp_cnt */
-#include "pi_ctrl.h"     /* PI_CTRL_Step / PI_VOUT_OVP_MV：PI 闭环 + OVP 阈值 */
-#include <stdio.h>       /* 编译器内置，仅用于浮点换算，不用 printf */
+#include "adc.h"
+#include "safe_sm.h"     /* SafeSM_OnSample / g_safe_state — VAUX 安全链路 */
+#include "pi_ctrl.h"     /* PI_CTRL_Step — PI 闭环 + VOUT OVP（内部处理分频/状态判断）*/
+#include "stm32g4xx_hal_adc.h"
 
 /* ============================================================================
  *  全局采样数据定义（每个通道只在此处定义一次；extern 声明在 adc_app.h）
@@ -17,6 +18,11 @@ volatile uint16_t g_vout_raw  = 0;
 volatile uint16_t g_vout_filt = 0;
 volatile uint16_t g_vout_mv   = 0;
 #endif
+
+/* VOUT DMA buffer：TIM3 触发 ADC2 转换 → DMA 自动搬运到此。
+ * PI_CTRL_Step()（pi_ctrl.c）读取 g_adc_dma_buf[0]。
+ * 始终分配（4 字节），不受 ADC_APP_ENABLE_VOUT 开关影响。*/
+uint16_t g_adc_dma_buf[2] = {0};
 
 #if ADC_APP_ENABLE_ICYCLE
 volatile uint16_t g_icycle_raw  = 0;
@@ -47,6 +53,12 @@ void ADC_APP_Init(void)
 
     /* 启动 TIM3 10kHz 周期中断。每次更新事件 → HAL_TIM_PeriodElapsedCallback */
     HAL_TIM_Base_Start_IT(&htim3);
+
+#if ADC_APP_ENABLE_VOUT
+    /* 启动 ADC2 DMA：TIM3 TRGO 硬件触发 ADC2 转换 → DMA 循环搬运到 g_adc_dma_buf。
+     * 启动后无需软件干预，PI_CTRL_Step() 在 ISR 中直接读 buffer 即可。*/
+    HAL_ADC_Start_DMA(&hadc2, (uint32_t *)g_adc_dma_buf, 1);
+#endif
 }
 
 /* ============================================================================
@@ -123,62 +135,10 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 #endif /* ADC_APP_ENABLE_VAUX */
 
     /* ========================================================================
-     *  VOUT — ADC2/IN12/PB2：LLC 输出电压
-     *  与 VAUX 同一节拍、独立 ADC，并行转换不影响 VAUX 延迟。
-     *  启用条件：硬件已飞线 VOUT 分压点 → PB2，且分压比已填入头文件。
+     *  VOUT — 已迁移至 PI_CTRL_Step()（pi_ctrl.c），通过 ADC DMA buffer 读取。
+     *  PI 控制器内部完成：ADC 读取 → EWMA 滤波 → mV 换算 → OVP 检查 → PI 计算。
+     *  此处不再轮询 VOUT，仅调用 PI_CTRL_Step() 触发上述流程。
      * ========================================================================*/
-#if ADC_APP_ENABLE_VOUT
-    {
-        /* 始终重配通道：轻量且幂等，保证不受 CubeMX 初始通道或其他 ADC2 通道干扰 */
-        ADC_ChannelConfTypeDef ch = {0};
-        ch.Channel      = ADC_VOUT_CHANNEL;
-        ch.Rank         = ADC_REGULAR_RANK_1;
-        ch.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
-        ch.SingleDiff   = ADC_SINGLE_ENDED;
-        HAL_ADC_ConfigChannel(&hadc2, &ch);
-
-        HAL_ADC_Start(&hadc2);
-
-        uint32_t guard = 4000U;
-        while (!__HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_EOC) && (--guard != 0U))
-        {
-        }
-
-        if (guard != 0U)
-        {
-            uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc2);
-            g_vout_raw = raw;
-
-            static uint32_t acc = 0;
-            static uint8_t  primed = 0;
-            if (!primed) { acc = (uint32_t)raw << ADC_APP_FILT_SHIFT; primed = 1; }
-            else         { acc += raw - (acc >> ADC_APP_FILT_SHIFT); }
-            uint16_t filt = (uint16_t)(acc >> ADC_APP_FILT_SHIFT);
-            g_vout_filt = filt;
-
-            /* 串口显示用：引脚电压 → 分压还原 → 标定 */
-            uint32_t pin_mv = ((uint32_t)raw * ADC_APP_VREF_MV) / ADC_APP_FULLSCALE;
-            float vout = (float)pin_mv * (float)ADC_VOUT_DIV_NUM / (float)ADC_VOUT_DIV_DEN;
-            vout = vout * ADC_VOUT_CAL_GAIN + ADC_VOUT_CAL_OFFSET;
-            if (vout < 0.0f) { vout = 0.0f; }
-            g_vout_mv = (uint16_t)(vout + 0.5f);
-
-            /* VOUT OVP：采样后立刻检测，覆盖 SOFTSTART + RUN。
-             * 触发 → g_ovp_cnt++ + SafeSM_EnterFault() 锁存封波，
-             * 主循环 Fault_Report_Poll 检测计数变化后打印。*/
-            {
-                uint16_t ovp_code = VOUT_MV_TO_CODE(PI_VOUT_OVP_MV);
-                if (filt > ovp_code)
-                {
-                    g_ovp_cnt++;
-                    SafeSM_EnterFault();
-                }
-            }
-        }
-
-        HAL_ADC_Stop(&hadc2);
-    }
-#endif /* ADC_APP_ENABLE_VOUT */
 
     /* ========================================================================
      *  I_CYCLE — ADC2/IN12/PB2：谐振腔电流
@@ -258,18 +218,8 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 #endif /* ADC_APP_ENABLE_IOU */
 
-    /* ---- PI 闭环：1kHz 分频执行（10kHz / 10）--------------------------- */
+    /* ---- PI 闭环 + VOUT OVP（PI_CTRL_Step 内部处理 10kHz OVP + 1kHz 分频）-- */
 #if ADC_APP_ENABLE_VOUT
-    {
-        static uint8_t pi_tick = 0;
-        if (++pi_tick >= 10U)
-        {
-            pi_tick = 0;
-            if (g_safe_state == SAFE_RUN)
-            {
-                PI_CTRL_Step();
-            }
-        }
-    }
+    PI_CTRL_Step();
 #endif
 }
