@@ -1,4 +1,4 @@
-/* USER CODE BEGIN Header */
+﻿/* USER CODE BEGIN Header */
 /**
   ******************************************************************************
   * @file           : main.c
@@ -36,7 +36,7 @@
 #include <stdio.h>
 #include "freq_skip.h"
 #include "fault_log.h"
-#include "adc_app.h"     /* 统一 ADC 采样（VAUX/VOUT/I_CYCLE/IOU）*/
+#include "adc_app.h"     /* 统一 ADC 采样（VAUX/VOUT/I_CYCLE/IOUT）*/
 #include "safe_sm.h"
 /* USER CODE END Includes */
 
@@ -141,7 +141,7 @@ int main(void)
   SafeSM_ConfigBrownout();       /* MCU 自身 PVD 欠压预警（BOR 见 safe_sm.c 顶部，为 option byte）*/
 
   /* 启动统一 ADC 采样（App/adc_app.c）：ADC1/ADC2 自校准 + TIM3 10kHz 周期中断。
-   * 默认启用 VAUX(ADC1/PA1)，VOUT/I_CYCLE/IOU 通过 adc_app.h 开关按需启用。*/
+   * 默认启用 VAUX(ADC1/PA1)，VOUT/I_CYCLE/IOUT 通过 adc_app.h 开关按需启用。*/
   ADC_APP_Init();               /* 统一 ADC 采样启动：自校准 + TIM3 10kHz（VAUX 默认开启）*/
 
   /* 关闭 stdout 缓冲：裸机 newlib 默认全缓冲，\n 不 flush，会导致"串口没输出"。*/
@@ -181,7 +181,7 @@ HRTIM1->sCommonRegs.ICR = HRTIM_ICR_FLT1C | HRTIM_ICR_FLT2C|HRTIM_ICR_FLT3C;
 
 // // 重新使能Fault 1
 HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_1, HRTIM_FAULTMODECTL_ENABLED);
-HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_2, HRTIM_FAULTMODECTL_ENABLED);
+// HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_2, HRTIM_FAULTMODECTL_ENABLED);
 HAL_HRTIM_FaultModeCtl(&hhrtim1, HRTIM_FAULT_3, HRTIM_FAULTMODECTL_ENABLED);
 
 

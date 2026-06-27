@@ -71,12 +71,10 @@ extern "C" {
  *  3. 周期限幅（单位：tick）
  *      频率换算：f_sw = 5440e6 / period
  *      PERIOD_MIN = 18133 → ~300kHz（最高频 = 最低增益）
- *      PERIOD_MAX = 45300 → ~120kHz（最低频，感性区下限，留余量防进入容性区）
- *      PERIOD_MAX = 50000 → ~108.8kHz（最低频，感性区下限，留余量防进入容性区）
+ *      PERIOD_MAX = 47000 → ~115.7kHz（fr 之下 M>1 区间，距容性区 ~6kHz 安全余量）
  * ==========================================================================*/
 #define PI_PERIOD_MIN       18133.0f
-// #define PI_PERIOD_MAX       45300.0f
-#define PI_PERIOD_MAX       48000.0f
+#define PI_PERIOD_MAX       47000.0f
 
 /* ============================================================================
  *  4. 分段 Kp 增益（单位：tick/mV）+ 分段边界（单位：tick）+ 滞回带（单位：tick）
@@ -85,9 +83,9 @@ extern "C" {
  *       - 接近谐振点时增益曲线变陡 → Kp 减小，避免过调/振荡
  *       - 滞回带 ±200 tick 防止 period 在边界附近来回穿越时 Kp 频繁切换
  * ==========================================================================*/
-#define PI_KP_HIGH          1.5f     /* period < SEG1，高频段：响应快 */
-#define PI_KP_MID           1.0f     /* SEG1~SEG2，中频段 */
-#define PI_KP_LOW           0.5f     /* period > SEG2，低频段（近谐振）：保守 */
+#define PI_KP_HIGH          0.5f     /* period < SEG1，高频段：响应快 */
+#define PI_KP_MID           0.3f     /* SEG1~SEG2，中频段；从 1.0 降到 0.3 减少噪声放大 */
+#define PI_KP_LOW           0.15f    /* period > SEG2，低频段（近谐振）：保守 */
 
 #define PI_PERIOD_SEG1      24000.0f /* ~227kHz，高/中频分界 */
 #define PI_PERIOD_SEG2      36000.0f /* ~151kHz，中/低频分界 */
@@ -103,13 +101,13 @@ extern "C" {
 #define PI_KI               0.05f    /* 积分增益 (tick/(mV·ms))，待整定 */
 #define PI_DEADBAND_MV      30.0f    /* 死区 ±30mV：误差在此范围内不调节 */
 #define PI_SLEW_MAX         300.0f   /* 单次 delta_u 上限 (tick/次) */
-#define PI_DECIMATION       10U      /* 10kHz→1kHz 分频比 */
+#define PI_DECIMATION       10U     /* 10kHz→1kHz 分频比：每 10 次 ISR 执行 1 次 PI */
 
 /* ============================================================================
  *  6. EWMA 低通滤波系数（α 越小越平滑，响应越慢）
- *     τ ≈ Ts/α = 0.1ms/0.1 = 1ms @ 10kHz
+ *     τ ≈ Ts/α = 1ms/0.03 ≈ 33ms @ 1kHz PI rate
  * ==========================================================================*/
-#define PI_EWMA_ALPHA       0.1f     /* 滤波系数，范围 (0, 1] */
+#define PI_EWMA_ALPHA       0.03f    /* 滤波系数；原 0.1 太弱导致噪声经 P 项放大 */
 
 /* ============================================================================
  *  7. 诊断结构体（全部使用 float，单位与计算中一致：mV、tick）

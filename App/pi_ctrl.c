@@ -10,7 +10,7 @@ volatile pi_ctrl_t g_pi = {0};
 volatile uint8_t   g_fault_request = 0;
 
 /* ADC DMA buffer — 由 adc_app.c 定义并启动 DMA，此处仅引用。
- * VOUT 通道数据在 g_adc_dma_buf[0]（TIM3 触发 ADC2 → DMA 自动搬运）。*/
+ * ADC2 扫描序列：Rank0=VOUT(CH12)=g_adc_dma_buf[0], Rank1=IOUT(CH5)=g_adc_dma_buf[1] */
 extern uint16_t g_adc_dma_buf[];
 
 /* ============================================================================

@@ -137,7 +137,7 @@ void Fault_Report_Poll(void)
         };
         safe_state_t st = g_safe_state;
 #if ADC_APP_ENABLE_VOUT
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
@@ -146,11 +146,12 @@ void Fault_Report_Poll(void)
                (unsigned long)g_fault.total_cnt,
                (unsigned long)g_pi.ovp_count,
                g_vaux_raw, g_vaux_filt, g_vaux_mv,
+               g_iout_raw, g_iout_filt, (int)g_iout_ma,
                g_pi.vout_raw, (double)g_pi.vout_filt,
                (double)g_pi.error, (double)g_pi.delta_p, (double)g_pi.delta_i,
                (unsigned int)g_pi.kp_segment);
 #else
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
+        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
@@ -159,6 +160,7 @@ void Fault_Report_Poll(void)
                (unsigned long)g_fault.total_cnt,
                (unsigned long)g_pi.ovp_count,
                g_vaux_raw, g_vaux_filt, g_vaux_mv,
+               g_iout_raw, g_iout_filt, (int)g_iout_ma,
                (double)g_pi.error, (double)g_pi.delta_p, (double)g_pi.delta_i,
                (unsigned int)g_pi.kp_segment);
 #endif

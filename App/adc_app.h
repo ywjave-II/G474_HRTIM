@@ -1,4 +1,4 @@
-#ifndef ADC_APP_H
+﻿#ifndef ADC_APP_H
 #define ADC_APP_H
 
 #ifdef __cplusplus
@@ -20,17 +20,17 @@ extern "C" {
  *    VAUX   — 辅助电源 24V 轨,  ADC1/IN2 /PA1  (10kHz TIM3 驱动，喂 SafeSM)
  *    VOUT   — LLC 输出电压,      ADC2/IN12/PB2  (已启用)
  *    I_CYCLE — 谐振腔电流,       ADC2/IN12/PB2  (硬件已配，待启用)
- *    IOU    — 输出电流,          ADC2/IN5 /PC4  (待启用；与 I_CYCLE 共用 ADC2)
+ *    IOUT    — 输出电流,          ADC2/IN5 /PC4  (DMA 序列 Rank1，与 VOUT 同扫描)
  *
- *  同一 ADC 上多通道时，TIM3 ISR 内顺序采样（Stop→重配通道→Start→自旋→读→Stop），
- *  每个额外通道增加 ~8µs；10kHz(100µs) 周期下 3 通道约 24µs，完全可接受。
+ *  ADC1（VAUX）仍用软件轮询；ADC2（VOUT+IOUT）已改为 TIM3 TRGO 硬件触发 +
+ *  DMA 扫描序列搬运，ISR 内直接读 DMA buffer，不再软件轮询。
  * ==========================================================================*/
 
 /* ---- 通道开关：1=启用, 0=停用（对应代码不会被编译）--------------------- */
 #define ADC_APP_ENABLE_VAUX    1   /* 辅助电源 24V 轨 — 安全链路核心，勿关 */
 #define ADC_APP_ENABLE_VOUT    1   /* LLC 输出电压 — 待硬件接线后改为 1 */
 #define ADC_APP_ENABLE_ICYCLE  0   /* 谐振腔电流   — 闭环阶段启用 */
-#define ADC_APP_ENABLE_IOU     0   /* 输出电流     — 闭环阶段启用；ADC2/IN5/PC4 */
+#define ADC_APP_ENABLE_IOUT     1   /* 输出电流     — DMA 序列 Rank1；ADC2/IN5/PC4 */
 
 /* ---- 通用参数（所有通道共享）------------------------------------------ */
 #define ADC_APP_VREF_MV       3300U  /* ADC 参考电压(mV) */
@@ -72,13 +72,15 @@ extern "C" {
 #define ADC_ICYCLE_OFFSET_MA  0
 #endif
 
-/* ---- IOU：输出电流 (ADC2/IN5/PC4) ----------------------- */
-#if ADC_APP_ENABLE_IOU
-#define ADC_IOU_HANDLE        hadc2
-#define ADC_IOU_CHANNEL       ADC_CHANNEL_5
-#define ADC_IOU_SCALE_NUM     1U
-#define ADC_IOU_SCALE_DEN     1U
-#define ADC_IOU_OFFSET_MA     0
+/* ---- IOUT：输出电流 (ADC2/IN5/PC4) -----------------------
+ * 硬件链路：Rshunt=20mΩ, G=50, Voffset=0
+ * I(mA) = raw × 3300/4095 / (0.02×50) = raw × 220 / 273    */
+#if ADC_APP_ENABLE_IOUT
+#define ADC_IOUT_HANDLE        hadc2
+#define ADC_IOUT_CHANNEL       ADC_CHANNEL_5
+#define ADC_IOUT_SCALE_NUM     3300U   /* VREF(mV) */
+#define ADC_IOUT_SCALE_DEN     4095U   /* 12bit FS */
+#define ADC_IOUT_OFFSET_MA     0
 #endif
 
 /* ============================================================================
@@ -125,10 +127,10 @@ extern volatile uint16_t g_icycle_filt;
 extern volatile int32_t  g_icycle_ma;    /* 电流值 (mA)，有符号 */
 #endif
 
-#if ADC_APP_ENABLE_IOU
-extern volatile uint16_t g_iou_raw;
-extern volatile uint16_t g_iou_filt;
-extern volatile int32_t  g_iou_ma;
+#if ADC_APP_ENABLE_IOUT
+extern volatile uint16_t g_iout_raw;
+extern volatile uint16_t g_iout_filt;
+extern volatile int32_t  g_iout_ma;
 #endif
 
 /* ============================================================================

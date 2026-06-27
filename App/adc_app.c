@@ -1,4 +1,4 @@
-#include "adc_app.h"
+﻿#include "adc_app.h"
 #include "adc.h"
 #include "safe_sm.h"     /* SafeSM_OnSample / g_safe_state — VAUX 安全链路 */
 #include "pi_ctrl.h"     /* PI_CTRL_Step — PI 闭环 + VOUT OVP（内部处理分频/状态判断）*/
@@ -19,9 +19,10 @@ volatile uint16_t g_vout_filt = 0;
 volatile uint16_t g_vout_mv   = 0;
 #endif
 
-/* VOUT DMA buffer：TIM3 触发 ADC2 转换 → DMA 自动搬运到此。
- * PI_CTRL_Step()（pi_ctrl.c）读取 g_adc_dma_buf[0]。
- * 始终分配（4 字节），不受 ADC_APP_ENABLE_VOUT 开关影响。*/
+/* ADC2 DMA buffer：TIM3 TRGO 触发 ADC2 扫描序列 → DMA 循环搬运。
+ * g_adc_dma_buf[0] = Rank0: VOUT (CH12/PB2) — PI_CTRL_Step() 消费
+ * g_adc_dma_buf[1] = Rank1: IOUT (CH5 /PC4) — 本文件 IOUT 块消费
+ * 大小 = NbrOfConversion = 2，始终分配，不受 #if 开关影响。*/
 uint16_t g_adc_dma_buf[2] = {0};
 
 #if ADC_APP_ENABLE_ICYCLE
@@ -30,10 +31,10 @@ volatile uint16_t g_icycle_filt = 0;
 volatile int32_t  g_icycle_ma   = 0;
 #endif
 
-#if ADC_APP_ENABLE_IOU
-volatile uint16_t g_iou_raw  = 0;
-volatile uint16_t g_iou_filt = 0;
-volatile int32_t  g_iou_ma   = 0;
+#if ADC_APP_ENABLE_IOUT
+volatile uint16_t g_iout_raw  = 0;
+volatile uint16_t g_iout_filt = 0;
+volatile int32_t  g_iout_ma   = 0;
 #endif
 
 /* ============================================================================
@@ -47,7 +48,7 @@ void ADC_APP_Init(void)
     HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
 #endif
 
-#if ADC_APP_ENABLE_VOUT || ADC_APP_ENABLE_ICYCLE || ADC_APP_ENABLE_IOU
+#if ADC_APP_ENABLE_VOUT || ADC_APP_ENABLE_ICYCLE || ADC_APP_ENABLE_IOUT
     HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
 #endif
 
@@ -57,7 +58,7 @@ void ADC_APP_Init(void)
 #if ADC_APP_ENABLE_VOUT
     /* 启动 ADC2 DMA：TIM3 TRGO 硬件触发 ADC2 转换 → DMA 循环搬运到 g_adc_dma_buf。
      * 启动后无需软件干预，PI_CTRL_Step() 在 ISR 中直接读 buffer 即可。*/
-    HAL_ADC_Start_DMA(&hadc2, (uint32_t *)g_adc_dma_buf, 1);
+    HAL_ADC_Start_DMA(&hadc2, (uint32_t *)g_adc_dma_buf, 2);  /* NbrOfConversion=2: VOUT(CH12)+IOUT(CH5) */
 #endif
 }
 
@@ -181,42 +182,26 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 #endif /* ADC_APP_ENABLE_ICYCLE */
 
     /* ========================================================================
-     *  IOU — ADC2/IN5/PC4：输出电流
+     *  IOUT — ADC2/IN5/PC4：输出电流（DMA 序列 Rank1）
+     *  ADC2 扫描序列：Rank0=VOUT(CH12) → Rank1=IOUT(CH5)
+     *  DMA 循环搬运到 g_adc_dma_buf[0..1]，无需软件 Start/Stop/自旋。
+     *  数据来自上一轮 TIM3 TRGO 触发（最旧 100µs，对电流监测可接受）。
      * ========================================================================*/
-#if ADC_APP_ENABLE_IOU
+#if ADC_APP_ENABLE_IOUT
     {
-        ADC_ChannelConfTypeDef ch = {0};
-        ch.Channel      = ADC_IOU_CHANNEL;
-        ch.Rank         = ADC_REGULAR_RANK_1;
-        ch.SamplingTime = ADC_SAMPLETIME_247CYCLES_5;
-        ch.SingleDiff   = ADC_SINGLE_ENDED;
-        HAL_ADC_ConfigChannel(&hadc2, &ch);
+        uint16_t raw = g_adc_dma_buf[1];   /* DMA Rank1 = IOUT */
+        g_iout_raw = raw;
 
-        HAL_ADC_Start(&hadc2);
+        static uint32_t acc = 0;
+        static uint8_t  primed = 0;
+        if (!primed) { acc = (uint32_t)raw << ADC_APP_FILT_SHIFT; primed = 1; }
+        else         { acc += raw - (acc >> ADC_APP_FILT_SHIFT); }
+        g_iout_filt = (uint16_t)(acc >> ADC_APP_FILT_SHIFT);
 
-        uint32_t guard = 4000U;
-        while (!__HAL_ADC_GET_FLAG(&hadc2, ADC_FLAG_EOC) && (--guard != 0U))
-        {
-        }
-
-        if (guard != 0U)
-        {
-            uint16_t raw = (uint16_t)HAL_ADC_GetValue(&hadc2);
-            g_iou_raw = raw;
-
-            static uint32_t acc = 0;
-            static uint8_t  primed = 0;
-            if (!primed) { acc = (uint32_t)raw << ADC_APP_FILT_SHIFT; primed = 1; }
-            else         { acc += raw - (acc >> ADC_APP_FILT_SHIFT); }
-            g_iou_filt = (uint16_t)(acc >> ADC_APP_FILT_SHIFT);
-
-            g_iou_ma = (int32_t)(((uint32_t)raw * ADC_IOU_SCALE_NUM) / ADC_IOU_SCALE_DEN)
-                     + ADC_IOU_OFFSET_MA;
-        }
-
-        HAL_ADC_Stop(&hadc2);
+        g_iout_ma = (int32_t)(((uint32_t)raw * ADC_IOUT_SCALE_NUM) / ADC_IOUT_SCALE_DEN)
+                 + ADC_IOUT_OFFSET_MA;
     }
-#endif /* ADC_APP_ENABLE_IOU */
+#endif /* ADC_APP_ENABLE_IOUT */
 
     /* ---- PI 闭环 + VOUT OVP（PI_CTRL_Step 内部处理 10kHz OVP + 1kHz 分频）-- */
 #if ADC_APP_ENABLE_VOUT
