@@ -2,6 +2,7 @@
 #include "freq_skip.h"    /* LLC_SoftStart_Init / softstart_done：复用扫频软启动 */
 #include "fault_log.h"    /* g_fault：硬件 FLT 触发记录，用于同步状态机 */
 #include "pi_ctrl.h"      /* PI_CTRL_Init：SOFTSTART→RUN 时积分清零 */
+#include "burst_mode.h"   /* BURST_ShouldEnter/Exit/Init：Burst Mode 状态切换 */
 
 /* ============================================================================
  *  BOR（掉电复位）—— 代码自动配置，无需任何外部工具：
@@ -21,18 +22,20 @@
 #define SAFE_FLT_FLAG_ALL  (HRTIM_FLAG_FLT1 | HRTIM_FLAG_FLT2 | HRTIM_FLAG_FLT3)
 
 volatile safe_state_t g_safe_state = SAFE_INIT;
+volatile fault_reason_t g_fault_entry_reason = FAULT_REASON_NONE;
 /* 注：g_ovp_cnt 已迁移至 pi_ctrl_t.ovp_count（pi_ctrl.c），定时在 PI_CTRL_Step 的 Step 0 递增。*/
 
 /* WAIT_AUX 中 VAUX 持续高于 REARM 的计时起点 */
 static uint8_t  aux_ok_timing = 0;
 static uint32_t aux_ok_t0     = 0;
 
-void SafeSM_EnterFault(void)
+void SafeSM_EnterFault(fault_reason_t reason)
 {
     /* 幂等：HRTIM 输出强制 inactive（断输出）+ DIS 失能。可从 ISR/主循环安全调用。
      * 注：硬件 FLT 触发时输出已被硬件封死，这里再 Stop 一次确保软件路也封死且不依赖硬件。*/
     HAL_HRTIM_WaveformOutputStop(&hhrtim1, SAFE_OUT_ALL);
     HALF_BRIDGE_DISABLE();
+    g_fault_entry_reason = reason;
     g_safe_state = SAFE_FAULT;
 }
 
@@ -93,9 +96,10 @@ void SafeSM_OnSample(uint16_t vaux_code)
      * WAIT_AUX/INIT/FAULT 本就封波，不重复触发。整数短路径。*/
     if (vaux_code < VAUX_SW_TRIP_CODE)
     {
-        if (g_safe_state == SAFE_SOFTSTART || g_safe_state == SAFE_RUN)
+        if (g_safe_state == SAFE_SOFTSTART || g_safe_state == SAFE_RUN
+            || g_safe_state == SAFE_BURST)
         {
-            SafeSM_EnterFault();
+            SafeSM_EnterFault(FAULT_REASON_VAUX_SW);
         }
     }
 }
@@ -122,9 +126,10 @@ void SafeSM_Poll(void)
     /* PVD 二次校验：MCU VDD 跌破 ~2.9V 时也优雅封波（BOR 会在更低处硬复位兜底）*/
     if (__HAL_PWR_GET_FLAG(PWR_FLAG_PVDO) != RESET)
     {
-        if (g_safe_state == SAFE_SOFTSTART || g_safe_state == SAFE_RUN)
+        if (g_safe_state == SAFE_SOFTSTART || g_safe_state == SAFE_RUN
+            || g_safe_state == SAFE_BURST)
         {
-            SafeSM_EnterFault();
+            SafeSM_EnterFault(FAULT_REASON_MCU_PVD);
         }
     }
 
@@ -133,7 +138,7 @@ void SafeSM_Poll(void)
     if (g_fault_request)
     {
         g_fault_request = 0;          /* 消费标志 */
-        SafeSM_EnterFault();
+        SafeSM_EnterFault(FAULT_REASON_VOUT_OVP);
         return;                       /* 本周期不再处理其他状态转移 */
     }
 
@@ -166,9 +171,12 @@ void SafeSM_Poll(void)
             break;
 
         case SAFE_SOFTSTART:
-            if (g_fault.tripped)              /* 软启动期间硬件 OCP/OVP/UVP 触发 */
+            if (g_fault.tripped)              /* 软启动期间硬件 FLT 触发 */
             {
-                SafeSM_EnterFault();
+                /* FLT1=VAUX 欠压（根源是辅源低，恢复可重启）；FLT2/3=OCP/OVP（永久锁死）*/
+                fault_reason_t reason = (g_fault.last_fault == FAULT_FLT1)
+                    ? FAULT_REASON_VAUX_HW : FAULT_REASON_OCP_OVP;
+                SafeSM_EnterFault(reason);
             }
             else if (softstart_done)          /* 扫频到位 -> 闭环 PI 稳压 */
             {
@@ -180,28 +188,70 @@ void SafeSM_Poll(void)
         case SAFE_RUN:
             if (g_fault.tripped)              /* 运行期间任何硬件 FLT 触发 -> 封波 */
             {
-                SafeSM_EnterFault();
+                /* FLT1=VAUX 欠压（根源是辅源低，恢复可重启）；FLT2/3=OCP/OVP（永久锁死）*/
+                fault_reason_t reason = (g_fault.last_fault == FAULT_FLT1)
+                    ? FAULT_REASON_VAUX_HW : FAULT_REASON_OCP_OVP;
+                SafeSM_EnterFault(reason);
+                break;
+            }
+            /* 轻载/空载：IOUT 低于门限持续 5ms → 进入 Burst Mode 间歇停波防过压 */
+            if (BURST_ShouldEnter())
+            {
+                BURST_Init();               /* 设 300kHz + 使能输出 + 算 ADC 码门限 */
+                g_safe_state = SAFE_BURST;
+                break;
             }
             /* PI_CTRL_Step() 已移至 TIM3 ISR（adc_app.c），1kHz 精确节拍执行。
              * 状态机只负责安全检测与转移，不再执行控制算法。*/
             break;
 
-        case SAFE_FAULT:
-            /* 重启条件：VAUX 回升到 REARM(23V) 即回 WAIT_AUX，由其完成「稳定50ms自检
-             * → 清 HRTIM 锁存故障 → 重走完整 SOFTSTART」。真正断透时 MCU 与 UCC21520 VCCI
-             * 共用同一供电链(24V→DCDC→5V→LDO→3.3V)，必随之掉电，下次为冷上电从 INIT 天然
-             * 安全重入，软件不再模拟「断透确认」。仅在 22~23V 抖动够不到 REARM → 停在 FAULT，
-             * 靠 HRTIM 锁存故障保持封波，不自动重启。*/
-            if (g_vaux_filt >= VAUX_REARM_CODE)
+        case SAFE_BURST:
+            if (g_fault.tripped)              /* Burst 期间硬件 FLT 触发 -> 封波 */
             {
-                g_safe_state = SAFE_WAIT_AUX;
+                /* FLT1=VAUX 欠压（可重启）；FLT2/3=OCP/OVP（永久锁死）*/
+                fault_reason_t reason = (g_fault.last_fault == FAULT_FLT1)
+                    ? FAULT_REASON_VAUX_HW : FAULT_REASON_OCP_OVP;
+                SafeSM_EnterFault(reason);
+                break;
             }
+            /* 负载恢复：IOUT 高于退出门限持续 5ms → 退出 Burst，回到 PI 闭环 */
+            if (BURST_ShouldExit())
+            {
+                /* 无扰动恢复：不清 EWMA，prev_error=0 防首拍冲击，
+                 * llc_period 已在 Burst 频率，PI 从此平滑起步 */
+                PI_CTRL_BumplessInit();
+                g_safe_state = SAFE_RUN;
+                break;
+            }
+            /* BURST_Step() 在 TIM3 ISR 中 1kHz 执行（pi_ctrl.c 内），
+             * 做 VOUT 滞回比较 + PWM 门控。状态机只负责状态切换。*/
+            break;
+
+        case SAFE_FAULT:
+            /* 按进入原因决定是否允许自动重启：
+             * - VAUX 类（FAULT_REASON_VAUX_HW / FAULT_REASON_VAUX_SW）：
+             *   根源是辅源电压低。VAUX 回升到 REARM(23V) 即回 WAIT_AUX，由其完成
+             *   「稳定 50ms 自检 → 清 HRTIM 锁存故障 → 重走完整 SOFTSTART」。
+             * - 非 VAUX 类（OCP_OVP / VOUT_OVP / MCU_PVD）：
+             *   根源可能未消除（过流短路、PI 参数错误导致容性区、MCU 供电异常等）。
+             *   永久锁死在 FAULT，不自动重启。仅掉电冷启恢复（MCU 与 UCC21520 VCCI
+             *   共用供电链，真正断透时必随之掉电 → 下次冷上电从 INIT 天然安全重入）。
+             *   也可通过串口指令等外部手段显式调用 Fault_Rearm() 恢复。*/
+            if (g_fault_entry_reason == FAULT_REASON_VAUX_HW ||
+                g_fault_entry_reason == FAULT_REASON_VAUX_SW)
+            {
+                if (g_vaux_filt >= VAUX_REARM_CODE)
+                {
+                    g_safe_state = SAFE_WAIT_AUX;
+                }
+            }
+            /* 非 VAUX 类故障：无出口，永久停留 FAULT */
             break;
 
         case SAFE_INIT:
         default:
             /* 正常不应停在 INIT；兜底拉回安全态 */
-            SafeSM_EnterFault();
+            SafeSM_EnterFault(FAULT_REASON_VAUX_SW);
             break;
     }
 }

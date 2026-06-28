@@ -2,6 +2,7 @@
 #include "safe_sm.h"   /* g_safe_state, SAFE_RUN, SAFE_SOFTSTART */
 #include "hrtim.h"     /* hhrtim1, HAL_HRTIM_WaveformOutputStop */
 #include "adc_app.h"   /* ADC_APP_ENABLE_VOUT — 与 buffer 定义保持同步 */
+#include "burst_mode.h"/* BURST_Step — BURST 状态下替代 PI 计算 */
 
 /* ============================================================================
  *  全局 PI 状态（仅此一处定义；extern 声明在 pi_ctrl.h）
@@ -100,6 +101,30 @@ void PI_CTRL_Init(void)
 }
 
 /* ============================================================================
+ *  PI_CTRL_BumplessInit — BURST→RUN 无扰动恢复
+ *  --------------------------------------------------------------------------
+ *  与 PI_CTRL_Init 的区别：
+ *    - 保留 vout_filt（VOUT EWMA 滤波值有效，无需重新爬升）
+ *    - 保留 kp_segment（当前频率段不变）
+ *    - 保留 s_ewma_primed = 1（不清零，ISR 中 EWMA 持续平滑）
+ *    - 清零 prev_error / error / delta_*（防首拍冲击）
+ *    - 重置 s_pi_tick（从干净节拍起点开始）
+ * ==========================================================================*/
+void PI_CTRL_BumplessInit(void)
+{
+    g_pi.error       = 0.0f;
+    g_pi.error_max   = 0.0f;
+    g_pi.prev_error  = 0.0f;
+    g_pi.delta_p     = 0.0f;
+    g_pi.delta_i     = 0.0f;
+    g_pi.delta_u     = 0.0f;
+    g_pi.integral    = 0.0f;
+
+    s_pi_tick        = 0;
+    /* vout_filt / kp_segment / s_ewma_primed 保留不动 */
+}
+
+/* ============================================================================
  *  PI_CTRL_Step — TIM3 10kHz ISR 内调用
  *  --------------------------------------------------------------------------
  *  执行顺序（15 步）：
@@ -130,7 +155,7 @@ void PI_CTRL_Step(void)
      *  注意：EWMA 首样未就绪时（vout_filt==0）跳过，避免误触发。
      * ========================================================================*/
     safe_state_t st = g_safe_state;   /* volatile 快照 */
-    if ((st == SAFE_SOFTSTART || st == SAFE_RUN)
+    if ((st == SAFE_SOFTSTART || st == SAFE_RUN || st == SAFE_BURST)
         && (g_pi.vout_filt > PI_VOUT_OVP_MV)
         && (g_pi.vout_filt > 0.0f))
     {
@@ -156,28 +181,40 @@ void PI_CTRL_Step(void)
     s_pi_tick = 0;
 
     /* ========================================================================
-     *  Step 2: ADC 读取 — 直接读 DMA buffer
+     *  Step 2: ADC 读取 — 直接读 DMA buffer（所有状态都执行）
      *  VOUT 在 g_adc_dma_buf[0]（ADC2 规则组，DMA 循环模式）。
+     *  即使 BURST 状态跳过 PI，也需更新 vout_raw/vout_filt：
+     *    - OVP 检查 (Step 0) 依赖 g_pi.vout_filt
+     *    - 串口 [STAT] 心跳打印 VOUT 诊断值
      * ========================================================================*/
-    uint16_t raw = g_adc_dma_buf[0];
-    g_pi.vout_raw = raw;
-
-    /* ========================================================================
-     *  Step 3: EWMA 低通滤波
-     *  filt = α·raw + (1-α)·prev_filt
-     *  首样直接预置，避免从 0 爬升期间误判。
-     * ========================================================================*/
-    float raw_mv = (float)raw * PI_VOUT_SCALE;
-
-    if (!s_ewma_primed)
     {
-        g_pi.vout_filt  = raw_mv;
-        s_ewma_primed   = 1;
+        uint16_t raw = g_adc_dma_buf[0];
+        g_pi.vout_raw = raw;
+
+        /* ========================================================================
+         *  Step 3: EWMA 低通滤波（所有状态都执行）
+         *  filt = α·raw + (1-α)·prev_filt
+         *  首样直接预置，避免从 0 爬升期间误判。
+         * ========================================================================*/
+        float raw_mv = (float)raw * PI_VOUT_SCALE;
+
+        if (!s_ewma_primed)
+        {
+            g_pi.vout_filt  = raw_mv;
+            s_ewma_primed   = 1;
+        }
+        else
+        {
+            g_pi.vout_filt = PI_EWMA_ALPHA * raw_mv
+                           + (1.0f - PI_EWMA_ALPHA) * g_pi.vout_filt;
+        }
     }
-    else
+
+    /* ---- BURST 门控：VOUT 数据已更新，走 Burst 滞回比较 + PWM 门控，跳过 PI ---- */
+    if (st == SAFE_BURST)
     {
-        g_pi.vout_filt = PI_EWMA_ALPHA * raw_mv
-                       + (1.0f - PI_EWMA_ALPHA) * g_pi.vout_filt;
+        BURST_Step();
+        return;
     }
 
     /* ========================================================================

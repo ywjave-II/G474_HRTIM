@@ -133,12 +133,18 @@ void Fault_Report_Poll(void)
         last_hb = now;
         uint32_t per = llc_period;
         static const char *const st_name[] = {
-            "INIT", "WAIT_AUX", "SOFTSTART", "RUN", "FAULT"
+            "INIT", "WAIT_AUX", "SOFTSTART", "RUN", "BURST", "FAULT"
+        };
+        static const char *const reason_name[] = {
+            "none", "VAUX_HW", "VAUX_SW", "OCP_OVP", "VOUT_OVP", "MCU_PVD"
         };
         safe_state_t st = g_safe_state;
+        fault_reason_t fr = g_fault_entry_reason;
+        const char *rs = (fr <= FAULT_REASON_MCU_PVD) ? reason_name[fr] : "?";
 #if ADC_APP_ENABLE_VOUT
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
+        printf("[STAT] state=%s reason=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
+               rs,
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,
@@ -151,8 +157,9 @@ void Fault_Report_Poll(void)
                (double)g_pi.error, (double)g_pi.delta_p, (double)g_pi.delta_i,
                (unsigned int)g_pi.kp_segment);
 #else
-        printf("[STAT] state=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
+        printf("[STAT] state=%s reason=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
+               rs,
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,

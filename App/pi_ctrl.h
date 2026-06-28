@@ -151,13 +151,20 @@ extern volatile uint8_t g_fault_request;
  *  API
  * ==========================================================================*/
 
-/* 进入 RUN 状态时调用一次：
+/* 进入 RUN 状态时调用一次（冷启动 / SOFTSTART→RUN）：
  * - vout_filt 预置首样（避免 EWMA 从 0 爬升）
  * - 积分/prev_error 清零
  * - error_max 清零
  * - kp_segment 重置到 MID
  * （slew_clip_count / windup_count / ovp_count 跨 RUN 保留，不在此清零）*/
 void PI_CTRL_Init(void);
+
+/* BURST→RUN 无扰动恢复（bumpless transfer）：
+ * - 保留 vout_filt（VOUT 滤波值有效，无需重新爬升）
+ * - 保留 kp_segment（当前频段不变）
+ * - 清零 prev_error / error / delta_*（防止首拍冲击）
+ * - 不清 EWMA 首样标志（s_ewma_primed 保持 1）*/
+void PI_CTRL_BumplessInit(void);
 
 /* TIM3 10kHz ISR 内调用（adc_app.c → HAL_TIM_PeriodElapsedCallback）：
  * - 每次调用都执行 OVP 检查（10kHz）

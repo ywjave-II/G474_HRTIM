@@ -60,11 +60,26 @@ typedef enum {
     SAFE_INIT = 0,    /* 复位后：强制封波 + DIS 失能（启动任何 PWM 之前）*/
     SAFE_WAIT_AUX,    /* 等辅源 ≥ REARM 且稳定，期间保持封波 */
     SAFE_SOFTSTART,   /* 复用现有 300k->140k 扫频软启动 */
-    SAFE_RUN,         /* 扫频结束开环定频运行 */
-    SAFE_FAULT        /* 封波 + DIS 失能，停留；VAUX 回升到 REARM 即回 WAIT_AUX 重启 */
+    SAFE_RUN,         /* 扫频结束，PI 闭环定频运行 */
+    SAFE_BURST,       /* 轻载/空载 Burst Mode：VOUT 滞回间歇停波，防过压 */
+    SAFE_FAULT        /* 封波 + DIS 失能，停留。VAUX 类故障 VAUX 回升后可重启；
+                          OCP/OVP/OVP_软件/PVD 类故障永久锁死，仅掉电冷启恢复 */
 } safe_state_t;
 
+/* FAULT 进入原因：决定 FAULT 状态是否允许自动重启。
+ * VAUX 相关（辅源低）：根源是辅源电压，恢复即可重启。
+ * 非 VAUX 相关（OCP/OVP/过压/MCU 欠压）：根源可能未消除，永久锁死。*/
+typedef enum {
+    FAULT_REASON_NONE = 0,
+    FAULT_REASON_VAUX_HW,    /* FLT1: VAUX < 21V 硬件欠压闸（COMP2 → Fault1）*/
+    FAULT_REASON_VAUX_SW,    /* VAUX < 22V 软件欠压检测（SafeSM_OnSample）*/
+    FAULT_REASON_OCP_OVP,    /* FLT2/FLT3: 硬件 OCP/OVP（COMP4/6 → Fault2/3）*/
+    FAULT_REASON_VOUT_OVP,   /* VOUT > 28V 软件过压（PI_CTRL_Step Step 0）*/
+    FAULT_REASON_MCU_PVD,    /* MCU VDD < 2.9V PVD 预警 */
+} fault_reason_t;
+
 extern volatile safe_state_t g_safe_state;
+extern volatile fault_reason_t g_fault_entry_reason;
 /* 注：g_ovp_cnt 已迁移至 pi_ctrl_t.ovp_count（pi_ctrl.h），
    串口打印请使用 PI_CTRL_GetDiagSnapshot() 获取快照。*/
 
@@ -85,8 +100,9 @@ void SafeSM_OnSample(uint16_t vaux_code);
 void SafeSM_Poll(void);
 
 /* 幂等的「立即进故障」：HRTIM 输出强制 inactive + DIS 失能 + 切 FAULT。
+ * reason 记录触发原因，决定 FAULT 状态是否允许自动重启（仅 VAUX 类放行）。
  * 可从任意上下文（ISR/主循环）安全调用。*/
-void SafeSM_EnterFault(void);
+void SafeSM_EnterFault(fault_reason_t reason);
 
 #ifdef __cplusplus
 }
