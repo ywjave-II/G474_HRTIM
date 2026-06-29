@@ -39,10 +39,10 @@ static uint8_t s_vout_high_cnt = 0;     /* 连续高于 OFF 门限的次数 */
 static uint8_t s_vout_low_cnt  = 0;     /* 连续低于 ON  门限的次数 */
 
 /* IOUT 去抖计时（主循环 HAL_GetTick 模式）*/
-static uint8_t  s_enter_timing = 0;     /* 1=正在计时 IOUT < enter 门限 */
-static uint32_t s_enter_t0     = 0;
-static uint8_t  s_exit_timing  = 0;     /* 1=正在计时 IOUT > exit  门限 */
-static uint32_t s_exit_t0      = 0;
+static uint8_t  s_enter_timing  = 0;    /* Channel 1: IOUT < enter 门限 */
+static uint32_t s_enter_t0      = 0;
+static uint8_t  s_exit_timing   = 0;    /* 退出：IOUT > exit 门限 */
+static uint32_t s_exit_t0       = 0;
 
 /* ============================================================================
  *  BURST_Init — 进入 Burst 状态时调用一次
@@ -66,6 +66,33 @@ void BURST_Init(void)
     s_burst_output_on = 1;
 
     /* 复位全部去抖状态 */
+    s_vout_high_cnt = 0;
+    s_vout_low_cnt  = 0;
+    s_enter_timing  = 0;
+    s_exit_timing   = 0;
+}
+
+/* ============================================================================
+ *  BURST_FastEnter — ISR 快速进入（TIM3 10kHz 上下文）
+ *  --------------------------------------------------------------------------
+ *  与 BURST_Init 的区别：
+ *    - ODISR 立即关 PWM（VOUT 已超门限，不能再发波）
+ *    - 其他初始化相同（ADC 码门限 / Burst 周期 / 去抖复位）
+ *    - ISR 安全：不调用 HAL，直接写寄存器
+ * ==========================================================================*/
+void BURST_FastEnter(void)
+{
+    s_burst_on_code  = (uint16_t)((float)g_burst_vout_on_mv  / PI_VOUT_SCALE + 0.5f);
+    s_burst_off_code = (uint16_t)((float)g_burst_vout_off_mv / PI_VOUT_SCALE + 0.5f);
+
+    llc_period = BURST_PERIOD;
+    HRTIM_SetLLCPeriod(BURST_PERIOD);
+
+    /* VOUT 已超 off 门限 → 立即关输出，不等 BURST_Step 去抖 */
+    HRTIM1->sCommonRegs.ODISR = BURST_OUT_MASK;
+    s_burst_output_on = 0;
+    g_burst_off_count++;
+
     s_vout_high_cnt = 0;
     s_vout_low_cnt  = 0;
     s_enter_timing  = 0;
@@ -137,9 +164,19 @@ void BURST_Step(void)
 
 /* ============================================================================
  *  BURST_ShouldEnter — 主循环 SafeSM_Poll RUN 分支调用
+ *  --------------------------------------------------------------------------
+ *  双通道进入，任一通道持续 5ms 即触发：
+ *
+ *   Channel 1（电流基）：IOUT < enter 门限（默认 100mA）→ 典型轻载/空载触发
+ *   Channel 2（电压基）：VOUT > off 门限（默认 24.5V）且 IOUT < exit 门限（默认 400mA）
+ *                       → 中轻载电压爬升时兜底，避免 PI 半饱和无力降压
+ *
+ *   Channel 2 的电流上限确认（< 400mA）是关键：防止大载动态瞬间超调
+ *   导致误入 Burst（大载下应让 PI 继续调节，而非间歇停波）。
  * ==========================================================================*/
 int BURST_ShouldEnter(void)
 {
+    /* ---- Channel 1：IOUT 持续低于进入门限 ---- */
     if (g_iout_ma < g_burst_iout_enter_ma)
     {
         if (!s_enter_timing)
@@ -150,13 +187,23 @@ int BURST_ShouldEnter(void)
         else if ((HAL_GetTick() - s_enter_t0) >= BURST_DEBOUNCE_MS)
         {
             s_enter_timing = 0;
-            return 1;   /* 确认进入 Burst */
+            return 1;
         }
     }
     else
     {
-        s_enter_timing = 0;   /* 电流回升，计时作废 */
+        s_enter_timing = 0;
     }
+
+    /* ---- Channel 2：VOUT 过高 + 电流确认不大 → 立即响应，无去抖 ----
+     * VOUT 已超过 Burst off 门限（默认 24.5V），多等 1ms 就多窜一截电压。
+     * 电流 < exit 门限（默认 400mA）已确认不是大载动态超调，直接进入 Burst。
+     * 进入后的 PWM 门控本身有 2 次去抖（BURST_Step），不会因单次噪声误动作。*/
+    if (g_pi.vout_filt > (float)g_burst_vout_off_mv && g_iout_ma < g_burst_iout_exit_ma)
+    {
+        return 1;
+    }
+
     return 0;
 }
 

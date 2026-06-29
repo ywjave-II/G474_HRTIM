@@ -142,11 +142,12 @@ void Fault_Report_Poll(void)
         fault_reason_t fr = g_fault_entry_reason;
         const char *rs = (fr <= FAULT_REASON_MCU_PVD) ? reason_name[fr] : "?";
 #if ADC_APP_ENABLE_VOUT
-        printf("[STAT] state=%s reason=%s period=%lu fsw=%lu Hz done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
+        printf("[STAT] state=%s reason=%s period=%lu fsw=%lu Hz frzee=%lu Hz,done=%u tripped=%u flt=%lu ovp=%lu | VAUX raw=%u filt=%u (%u mV) | IOUT raw=%u filt=%u (%d mA) | VOUT raw=%u filt=%.0f mV | PI err=%.0f mV dP=%.1f dI=%.1f seg=%u\r\n",
                (st <= SAFE_FAULT) ? st_name[st] : "?",
                rs,
                (unsigned long)per,
                (unsigned long)(per ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
+               (unsigned long)(llc_period_frzee ? (HRTIM_EQUIV_CLK_HZ / per) : 0),
                softstart_done,
                g_fault.tripped,
                (unsigned long)g_fault.total_cnt,

@@ -1,10 +1,14 @@
 #include "freq_skip.h"
-
+#include "adc_app.h"
+#include <stdint.h>
 
 // 变量定义（只在这里定义一次，不加static因为.h中有extern）
 volatile uint32_t llc_period = LLC_FREQ_START_PER;
+volatile uint32_t llc_period_frzee =0;
 volatile uint8_t  softstart_done = 0;
-
+/* ADC DMA buffer — 由 adc_app.c 定义并启动 DMA，此处仅引用。
+ * ADC2 扫描序列：Rank0=VOUT(CH12)=g_adc_dma_buf[0], Rank1=IOUT(CH5)=g_adc_dma_buf[1] */
+extern uint16_t g_adc_dma_buf[];
 void LLC_SoftStart_Init(void)
 {
     /* (1) 复位扫频状态到 300k 起点（冷启动 / re-arm 共用此入口）。*/
@@ -26,7 +30,7 @@ void LLC_SoftStart_Init(void)
     /* (3) 先把计数器清零，再强制「预装载 -> 有效寄存器」立即生效。
      *     顺序关键：在 CNT=0 的干净点做 SoftwareUpdate，使 period 与 TimerA interleaved 自动
      *     CMP1=PER/2 在【同一更新事件】里一起 latch。否则首拍 CMP1 可能仍是旧 PER/2(≈19550)，
-     *     而新周期只有 18133<19550 → TA1 第一周期内等不到复位点 → 首拍高电平拖到次拍(≈3 倍宽)。
+     *     而新周期只有 18133<19550 → TA1 第一周期内等不到复位点 → 首拍高电平拖到次拍(≈3 倍宽)。LLC_FREQ_START_PER
      *     HAL 文档原义："Force an immediate transfer from the preload to the active register"。*/
     HAL_HRTIM_SoftwareReset(&hhrtim1,
         HRTIM_TIMERRESET_MASTER | HRTIM_TIMERRESET_TIMER_A | HRTIM_TIMERRESET_TIMER_C);
@@ -71,7 +75,14 @@ void LLC_SoftStart_Step(void)
     static uint16_t skip_cnt = 0;
 
     if (softstart_done) return;
-
+    
+    
+    if (g_adc_dma_buf[0]>SOFTSTAR_EXIT_ADC_CODE) {
+        softstart_done = 1;
+        skip_cnt = 0;
+        llc_period_frzee=llc_period;
+        return; // 提前退出，等待下一拍状态机无缝切换至 RUN(PI控制)
+    }
     skip_cnt++;
     if (skip_cnt >= LLC_SKIP_COUNT)
     {

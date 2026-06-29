@@ -60,6 +60,17 @@
 > BURST 被全部安全检查覆盖（VAUX 22V/PVD/OVP/FLT）。Burst Mode 下 PI 冻结（`PI_CTRL_Step` 中
 > `st==BURST` 走 `BURST_Step` 后 return）。
 >
+> **2026-06-29 进展（v12）—— 软启动 VOUT 提前退出 + BURST 双通道进入 + ISR 预触发防过冲**：
+> **软启动 VOUT 提前退出**：`LLC_SoftStart_Step()` 中新增 VOUT 比较（`SOFTSTAR_EXIT_ADC_CODE`≈23V），
+> 扫频期间 VOUT 达标立即结束，不再死等到 135kHz。**修复 PI/软启动抢 llc_period**：`PI_CTRL_Step()`
+> 新增 `SAFE_SOFTSTART` 门控，扫频期间 PI 计算跳过，period 完全由软启动独占。
+> **BURST 双通道进入**：Ch1（电流基）IOUT<100mA 持续 5ms 保持；Ch2（电压基）VOUT>24.2V 且
+> IOUT<400mA → **立即响应无去抖**，捕获中轻载电压爬升。Ch2 电流上限确认防大载动态误切。
+> **ISR 10kHz 预触发（`BURST_FastEnter`）**：Ch2 检测搬到 TIM3 ISR 10kHz 快路径（与 OVP 同级），
+> VOUT 超门限后最多 100µs 即 ODISR 硬关 PWM + 切 SAFE_BURST，消除主循环 printf 阻塞导致的
+> 1~2V 过冲（原路径延迟可达 10+ms）。BURST 参数调优：off 门限 24.5V→24.2V，
+> Burst 频率 135kHz→160kHz。
+>
 > **2026-06-24 进展（v9）—— PI 浮点化重写 + VOUT ADC2 DMA 硬件触发**：
 > **PI 控制器**：Q8.8 定点 → 全 float 实现（利用 M4F FPU）；`pi_ctrl_t` 结构体重构（mV/tick
 > 物理单位 + 累计统计）；分段 Kp 新增 200 tick 滞回防 chattering；死区（±30mV）内持续更新
@@ -88,7 +99,7 @@
 | Flash | 512 KB |
 | RAM | 128 KB（Heap 512 B，Stack 1024 B） |
 
-应用场景：**半桥 LLC 谐振变换器**驱动固件，采用 **PFM 变频控制**。已实现**增量式 PI 闭环 VOUT 稳压**（带载实测 23.9V 稳定）；空载 Burst Mode 待实现。
+应用场景：**半桥 LLC 谐振变换器**驱动固件，采用 **PFM 变频控制**。已实现**增量式 PI 闭环 VOUT 稳压**（带载实测 23.9V 稳定）+ **Burst Mode 空载/轻载防过压**（双通道进入 + ISR 预触发）。
 
 ---
 
@@ -132,6 +143,9 @@ while(1) ─→ SafeSM_Poll()          // 安全状态机：WAIT_AUX/SOFTSTART/R
 > **v8.1 架构变更**：PI_CTRL_Step() 从主循环移入 **TIM3 ISR**（与 VOUT 采样同节拍，1kHz 精确分频），
 > 消除主循环 printf 阻塞导致的节拍不确定性。OVP 检测也移入 TIM3 ISR，覆盖 SOFTSTART+RUN 全状态。
 > 主循环退化为纯诊断 + 安全调度，不再执行实时控制。
+>
+> **v12 架构补充**：`PI_CTRL_Step()` 内新增 `SAFE_SOFTSTART` 门控（扫频期间跳过 PI 计算，period 独占）
+> + ISR 10kHz BURST 预触发（VOUT 超门限→ODISR 直接关 PWM，不等主循环）。
 
 ---
 
@@ -451,8 +465,9 @@ cmake --build build/Debug
 |---|---|---|---|---|
 | PLLN | 85 | — | main.c:235 | SYSCLK 170 MHz（HSE 12M/DIV3）|
 | LLC_FREQ_START_PER | 18133 | tick | freq_skip.h:12 | 软启动起始 300 kHz |
-| LLC_FREQ_TARGET_PER | 39100 | tick | freq_skip.h:13 | 软启动目标 139.5 kHz |
-| LLC_SOFTSTART_STEP | 10 | tick | freq_skip.h:14 | 扫频步进 |
+| LLC_FREQ_TARGET_PER | 40300 | tick | freq_skip.h:14 | 软启动目标 135 kHz（VOUT≥23V 可提前退出）|
+| SOFTSTAR_EXIT_ADC_CODE | 2593 | ADC码 | adc_app.h:62 | 软启动 VOUT 提前退出门限 ≈23V |
+| LLC_SOFTSTART_STEP | 10 | tick | freq_skip.h:15 | 扫频步进 |
 | LLC_SKIP_COUNT | 10 | 次 | freq_skip.h:16 | 中断分频 |
 | Period（初值）| 27200 | tick | hrtim.c:81 | 200 kHz 上电瞬时值 |
 | RepetitionCounter | 3 | — | hrtim.c:82 | 4 周期更新 |
@@ -483,6 +498,12 @@ cmake --build build/Debug
 | IOUT 采样电阻 | 20 | mΩ | 硬件 | Rshunt |
 | IOUT 运放增益 | 50 | 倍 | 硬件 | G, Voffset=0 |
 | IOUT 换算 | 3300/4095 | — | adc_app.h | `g_iout_ma = raw × SCALE_NUM / SCALE_DEN` |
+| BURST_IOUT_ENTER_MA_DEF | 100 | mA | burst_mode.h:35 | Ch1 进入门限（IOUT<此值 持续5ms → BURST）|
+| BURST_IOUT_EXIT_MA_DEF | 400 | mA | burst_mode.h:36 | 退出门限（IOUT>此值 持续5ms → RUN）；也是 Ch2 电流上限 |
+| BURST_VOUT_OFF_MV_DEF | 24200 | mV | burst_mode.h:40 | VOUT 滞回上门限（v12: 24500→24200）；Ch2 进入触发点 |
+| BURST_VOUT_ON_MV_DEF | 23800 | mV | burst_mode.h:39 | VOUT 滞回下门限（低于此值恢复 PWM）|
+| BURST_PERIOD | 34000 | tick | burst_mode.h:43 | Burst 固定频率 160kHz（v12: 135kHz→160kHz）|
+| BURST FastEnter 延迟 | ≤100 | µs | pi_ctrl.c | ISR 10kHz 预触发：检测→ODISR 关 PWM 最大延迟 |
 
 ---
 
@@ -622,6 +643,26 @@ cmake --build build/Debug
 - 解决：Ki/Kp ≥ 2:1（最终 Kp=256/Ki=512）。此时同样场景：`delta_p = +50`，`delta_i = −300`，净 `delta_u = −250`，方向始终正确。**核心原则：增量式 PI 中 I 项驱动力必须 ≥ P 项恢复力的 2 倍，否则瞬态修正方向可能反转。**
 - 空载过冲的根治方案不是再调 PI 参数，而是实现 **Burst Mode**（VOUT>OVP 阈值时直接间歇停波），因为空载时即使 period 推到 300kHz（PI_PERIOD_MIN），LLC 增益仍然太高，PI 已经饱和无力降压。
 
+### PI_CTRL_Step 在 SOFTSTART 期间偷偷跑 PI 计算（2026-06-29，v12 修复）
+- **现象**：软启动新增 VOUT≥23V 提前退出代码后不生效，扫频仍然走完 300k→135kHz 全程。
+- **调试**：代码逻辑正确（读 `g_adc_dma_buf[0]` 和 `SOFTSTAR_EXIT_ADC_CODE` 比较，阈值≈23V），
+  但串口 `[STAT]` 心跳显示 period 变化轨迹不是单调平滑扫频曲线。
+- **真因**：`PI_CTRL_Step()` 内部的 state guard 漏写了 `SAFE_SOFTSTART`——只有 OVP 检查（Step 0）
+  覆盖 SOFTSTART，BURST 门控覆盖 BURST，但 **Step 4-15 的 PI 计算没有状态判断**。软启动期间 PI
+  也在 1kHz 节拍修改 `llc_period` 并写 HRTIM 寄存器，与 MREP ISR 中的 `LLC_SoftStart_Step()` 抢
+  同一个变量。
+- **修复**：在 `PI_CTRL_Step()` 的 BURST 门控之后新增 `if (st == SAFE_SOFTSTART) return;`，
+  扫频期间只做 OVP + ADC/EWMA 数据更新，PI 计算完全跳过，period 由软启动独占。
+
+### BURST Ch2 主循环检测延迟致 1~2V 过冲（2026-06-29，v12 修复）
+- **现象**：BURST Ch2（VOUT>24.2V & IOUT<400mA）已无去抖、立即返回，但 VOUT 仍过冲到 ~25V。
+- **真因**：虽然 `BURST_ShouldEnter()` 无去抖，但它运行在**主循环** `SafeSM_Poll` 上下文中。
+  主循环每轮都调用 `Fault_Report_Poll`，每秒一次 `[STAT]` printf 通过 115200 波特率串口阻塞发送，
+  期间 `SafeSM_Poll` 得不到执行。VOUT 从 24.2V 窜到 25V 就是这数毫秒的事——检测准但执行慢。
+- **修复**：Ch2 检测搬到 **TIM3 ISR 10kHz 快路径**（`PI_CTRL_Step` Step 0 区域，与 OVP 同级）。
+  新增 `BURST_FastEnter()`——检测到条件后 100µs 内 ODISR 硬关 PWM + 切 `SAFE_BURST`，
+  不经主循环。与 `BURST_Init` 的区别：ODISR 关输出而非 OENR 开输出（VOUT 已超门限，必须先封波）。
+
 ---
 
 ### 5c. 辅助电源(VAUX)安全监测 + 安全重入状态机（`App/safe_sm.c` / `adc_app.c`）
@@ -712,9 +753,10 @@ cmake --build build/Debug
 | VAUX 标定 | `adc_app.h` | ⚠️ `ADC_VAUX_CAL_GAIN/OFFSET` 默认未校正 |
 | 故障恢复 | `fault_log.c` | 已有 `Fault_Rearm()`，无自动恢复（对 OCP/OVP 有意）；尚无触发入口（如串口指令） |
 | Fault 消抖 | `hrtim.c` | ✅ 已用 `FAULTFILTER_9` + COMP2 迟滞 40MV；COMP4/6 仍 20MV + PB11 RC 待补 |
-| Burst Mode（空载防过冲）| `App/burst_mode.c/h` | ✅ 已实现（v11）：IOUT 基进入/退出 + VOUT 滞回 PWM 门控(ODISR/OENR) + 标定接口 |
+| Burst Mode（空载防过冲）| `App/burst_mode.c/h` | ✅ 已实现（v12）：双通道进入(Ch1电流基 5ms + Ch2电压基立即) + ISR 10kHz预触发(`BURST_FastEnter`) + ODISR/OENR PWM门控 + 标定接口 |
 | HRTIM 硬件 Burst Controller | `App/burst_mode.c` | ⚠️ BMCR 方案已尝试但未调通（时钟/触发/模式组合待研究），当前软件门控等效 |
-| Burst Mode 实测/标定 | `App/burst_mode.c/h` | ⚠️ 门限待空载实测标定，串口调参接口待实现 |
+| Burst Mode 实测/标定 | `App/burst_mode.c/h` | ⚠️ 门限待空载实测标定（当前 off=24.2V/频率=160kHz），串口调参接口待实现 |
+| 软启动 VOUT 提前退出 | `App/freq_skip.c` | ✅ 已实现（v12）：VOUT≥23V 立即 `softstart_done=1`；修复 PI/SOFTSTART 抢 period bug |
 | 电流闭环/双环 | `adc_app.c` | 🔒 待 I_CYCLE/IOUT 硬件接线 + 启用 |
 
 ---
@@ -761,7 +803,8 @@ G474_HRTIM/
 - **v8（2026-06-20 下午）**：**PI 重构为增量式（velocity form）**。`delta_p = Kp×(error−prev_error)` + `delta_i = Ki×error`，`period += delta_u`，消除双重积分。新增 Anti-Windup、Slew Rate 限制、CMP4 下溢保护、寄存器写入顺序修复。调参：Kp=256(1.00)/Ki=512(2.00)，Ki/Kp=2:1 保证方向始终正确。**带载闭环实测**：VOUT 稳定于 23.9V（`PI_PERIOD_MAX` 扩至 ~110kHz）。
 - **v8.1（2026-06-20 晚间）**：**PI/OVP 移入 TIM3 ISR + 状态机瘦身**。PI_CTRL_Step 从主循环移入 10kHz ISR（1kHz 分频），删除内部限速器；OVP 检测同步移入 ISR，覆盖全状态，留痕迹（g_ovp_cnt + 边沿打印）；SafeSM_Poll 退化为纯安全调度。命令行编译路径固化到 CLAUDE.md。
 - **v9（2026-06-24）**：**PI 浮点化重写 + VOUT ADC2 DMA 硬件触发**。PI 全部改用 float（分段 Kp 滞回/死区/浮点无截断 I/Anti-Windup 修复）；VOUT 改为 TIM3 TRGO 硬件触发 ADC2 + DMA 循环搬运，ISR 直接读 buffer；`HRTIM_SetLLCPeriod()` 统一写入；`g_fault_request` OVP 快慢分离。**首次闭环实测**：55Ω 负载下 VOUT 稳定 ~24V，工作频率 ~115kHz（period≈47k）远低于设计谐振点 130kHz；PI_PERIOD_MAX=50000(108.8kHz) 下 FLT3 反复触发（容性区 ZVS 丢失）。调试发现真实 fr 可能在 135~145kHz，匝比 8:1 + 381V 母线 + 0.525V 二极管压降 → Vout(fr)≈23.29V 理论上不够 24V —— 问题在 LLC 增益而非 PI 控制。下一步：实测真实 fr + 修正 PI_PERIOD_MAX + FAULT 锁死不自动重启。
-- **v10（2026-06-27）**：**IOUT 输出电流采样 + PI 调参 + ADC2 完善**。IOUT(ADC2/IN5/PC4) 加入 ADC2 DMA 扫描序列（与 VOUT 同为 Rank0/Rank1，TIM3 TRGO 硬件触发，解决焊接冷焊问题后验证通过）；CubeMX `ADC2 ContinuousConvMode→DISABLE`（每个 TRGO 仅触发一次扫描，采样率精确 10kHz）；IOUT 换算参数填入（R=20mΩ/G=50/Vofs=0, `raw×3300/4095`）；全工程 `IOU→IOUT` 重命名（变量 `g_iout_*`、宏 `ADC_IOUT_*`、注释）；`[STAT]` 心跳增设 IOUT 字段（raw/filt/mA）；PI 调参：`PI_DECIMATION=10`（修复 1→10 bug，PI 真正运行在 1kHz）、EWMA α 0.03、Kp 0.5/0.3/0.15（降噪）、`PI_PERIOD_MAX=47000`(115.7kHz)。\n- **v11（2026-06-28，当前）**：**FAULT 按类型区分锁死 + Burst Mode 空载防过压**：
+- **v10（2026-06-27）**：**IOUT 输出电流采样 + PI 调参 + ADC2 完善**。IOUT(ADC2/IN5/PC4) 加入 ADC2 DMA 扫描序列（与 VOUT 同为 Rank0/Rank1，TIM3 TRGO 硬件触发，解决焊接冷焊问题后验证通过）；CubeMX `ADC2 ContinuousConvMode→DISABLE`（每个 TRGO 仅触发一次扫描，采样率精确 10kHz）；IOUT 换算参数填入（R=20mΩ/G=50/Vofs=0, `raw×3300/4095`）；全工程 `IOU→IOUT` 重命名（变量 `g_iout_*`、宏 `ADC_IOUT_*`、注释）；`[STAT]` 心跳增设 IOUT 字段（raw/filt/mA）；PI 调参：`PI_DECIMATION=10`（修复 1→10 bug，PI 真正运行在 1kHz）、EWMA α 0.03、Kp 0.5/0.3/0.15（降噪）、`PI_PERIOD_MAX=47000`(115.7kHz)。
+- **v11（2026-06-28）**：**FAULT 按类型区分锁死 + Burst Mode 空载防过压**：
 **FAULT 按类型区分**：新增 `fault_reason_t` 枚举记录进入原因；FAULT 分支仅 VAUX 类
 （VAUX_HW/VAUX_SW）允许 VAUX 恢复后自动重启；OCP_OVP/VOUT_OVP/MCU_PVD 永久锁死仅掉电冷启恢复，
 消除 OCP 死循环。`[STAT]` 心跳新增 `reason=` 字段。
@@ -779,6 +822,17 @@ Controller（BMCR/BMPER/BMCMPR）已尝试配置但未成功生效，待后续�
 `g_burst_vout_off_mv` + `g_burst_on_count`/`g_burst_off_count` 诊断计数器，预留串口调参。
 BURST 被全部安全检查覆盖（VAUX 22V/PVD/OVP/FLT）。
 **待解决**：HRTIM BMCR 硬件 Burst Controller 未调通，当前用 ODISR/OENR 软件门控等效。
+- **v12（2026-06-29，当前）**：**软启动 VOUT 提前退出 + BURST 双通道进入 + ISR 预触发防过冲**：
+**软启动 VOUT 提前退出**：`freq_skip.c` 新增 VOUT ADC 比较（`SOFTSTAR_EXIT_ADC_CODE`=2593≈23V），
+扫频期间 VOUT 达标即 `softstart_done=1`，不再死等 135kHz。`PI_CTRL_Step()` 发现并修复了
+`SAFE_SOFTSTART` 状态 guard 缺失 bug——扫频期间 PI 也在暗中修改 `llc_period`，与软启动抢寄存器。
+新增 `SAFE_SOFTSTART` 门控后 period 完全由 `LLC_SoftStart_Step()` 独占。
+**BURST 双通道进入**：Ch1（电流基）IOUT<100mA 持续 5ms 保持；Ch2（电压基）VOUT>24.2V 且
+IOUT<400mA → **立即响应无去抖**（防中轻载电压爬升，电流上限确认防大载误切）。
+**ISR 10kHz 预触发**：`BURST_FastEnter()` 新增，Ch2 检测搬到 TIM3 ISR 10kHz 快路径（与 OVP
+同级），VOUT 超门限后最多 100µs 即 ODISR 硬关 PWM + 切 `SAFE_BURST`。消除主循环 printf 阻塞
+（可长达 10+ms）导致的 1~2V 过冲。与 `BURST_Init` 的区别：ODISR 关输出而非 OENR 开输出。
+**参数调优**：off 门限 24500→24200mV，Burst 频率 135kHz→160kHz（BURST_PERIOD 40300→34000）。
 
 ---
 
@@ -801,10 +855,14 @@ BURST 被全部安全检查覆盖（VAUX 22V/PVD/OVP/FLT）。
 > - **首次闭环实测通过**：55Ω 负载 VOUT 稳定 ~24V，PI 响应正常 ✓（v9）
 > - **FAULT 按类型区分重启**：VAUX 类(FLT1/软件22V)可自动重启，OCP/OVP/VOUT_OVP/PVD 永久锁死（消除 OCP 死循环）✓（v11）
 > - **Burst Mode（空载防过压）**：IOUT 基进入/退出 + VOUT 滞回 PWM 门控，含标定接口，全安全检查覆盖 ✓（v11）
+> - **BURST 双通道进入**：Ch1 电流基(IOUT<100mA 5ms) + Ch2 电压基(VOUT>24.2V & IOUT<400mA 立即) ✓（v12）
+> - **ISR 10kHz BURST 预触发**：`BURST_FastEnter()` 百µs 级 ODISR 关 PWM，消除主循环延迟导致的过冲 ✓（v12）
+> - **软启动 VOUT 提前退出**：扫频期间 VOUT≥23V 立即结束，不再死等 135kHz ✓（v12）
+> - **PI/SOFTSTART 抢 period bug 修复**：新增 `SAFE_SOFTSTART` 门控，扫频期间 PI 计算跳过 ✓（v12）
 >
 > **下一步（按优先级）**：
 > 1. **实测真实 fr**：空载开环扫频（示波器看原边电流/电压同相点），确认真实串联谐振频率。当前数据暗示 fr 在 135~145kHz，而非设计值 130kHz
 > 2. **修正 PI_PERIOD_MAX**：确认真实 fr 后，`PI_PERIOD_MAX` 设在 fr 之上 3~5kHz 安全余量，防止 PI 将频率推入容性区
-> 3. **Burst Mode 实测/标定**：空载上电验证 VOUT 滞回门控正常，确认 Burst ON/OFF 门限合适，必要时通过串口调 `g_burst_*` 变量
+> 3. **Burst Mode 参数实测标定**：空载/轻载上电验证 VOUT 滞回门控正常，通过串口调 `g_burst_*` 变量优化进入/退出/ON/OFF 门限
 > 4. **电流闭环/双环**：已具备 IOUT 采样基础，可探索电流内环 + 电压外环
 > 5. **抗扰加固（可选）**：COMP4/6 迟滞（+ PB11 硬件 RC）——补强原 OCP/OVP 噪声裕量

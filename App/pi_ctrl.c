@@ -155,6 +155,8 @@ void PI_CTRL_Step(void)
      *  注意：EWMA 首样未就绪时（vout_filt==0）跳过，避免误触发。
      * ========================================================================*/
     safe_state_t st = g_safe_state;   /* volatile 快照 */
+
+    /* ---- OVP 检查（10kHz，SOFTSTART/RUN/BURST）---- */
     if ((st == SAFE_SOFTSTART || st == SAFE_RUN || st == SAFE_BURST)
         && (g_pi.vout_filt > PI_VOUT_OVP_MV)
         && (g_pi.vout_filt > 0.0f))
@@ -167,6 +169,20 @@ void PI_CTRL_Step(void)
         HAL_HRTIM_WaveformOutputStop(&hhrtim1,
             HRTIM_OUTPUT_TA1 | HRTIM_OUTPUT_TA2 |
             HRTIM_OUTPUT_TC1 | HRTIM_OUTPUT_TC2);
+        return;
+    }
+
+    /* ---- BURST 预触发（10kHz 快路径，与 OVP 同级）----
+     * RUN 状态下 VOUT 超过 Burst off 门限 且 电流确认不大 →
+     * ISR 内直接 ODISR 关 PWM + 切 SAFE_BURST，不等待主循环。
+     * 主循环可能被 printf 阻塞数 ms，等它处理时 VOUT 已窜高 1~2V。*/
+    if (st == SAFE_RUN
+        && g_pi.vout_filt > (float)g_burst_vout_off_mv
+        && g_iout_ma < g_burst_iout_exit_ma
+        && g_pi.vout_filt > 0.0f)
+    {
+        BURST_FastEnter();
+        g_safe_state = SAFE_BURST;
         return;
     }
 
@@ -214,6 +230,13 @@ void PI_CTRL_Step(void)
     if (st == SAFE_BURST)
     {
         BURST_Step();
+        return;
+    }
+
+    /* ---- SOFTSTART 门控：扫频期间只做 OVP + ADC 采样，PI 计算跳过，
+     *     llc_period 完全由 LLC_SoftStart_Step() 独立控制。---- */
+    if (st == SAFE_SOFTSTART)
+    {
         return;
     }
 

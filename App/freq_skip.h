@@ -25,7 +25,7 @@ extern "C" {
 /* Exported types ----------------------------------------------------*/
 extern  volatile uint32_t llc_period;
 extern  volatile uint8_t  softstart_done;
-
+extern  volatile uint32_t llc_period_frzee;
 /* Exported constants ------------------------------------------------*/
 
 
